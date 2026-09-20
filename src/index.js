@@ -6,6 +6,7 @@ import { pool } from './db.js';
 import { migrate } from './migrate.js';
 import { Users, Sites, Categories, SpareParts, Logs, Gallery, FixedAssets, WorkOrders } from './repo.js';
 import { signToken, requireAuth, requireSuperAdmin } from './auth.js';
+import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weeklyReport.js';
 
 const PORT = process.env.PORT || 4000;
 const DEFAULT_SITE_KEYS = ['bekasi', 'indramayu', 'blora', 'setu'];
@@ -396,6 +397,8 @@ app.get('/api/reports/summary', requireAuth, asyncRoute(async (_req, res) => {
   });
 }));
 
+app.use('/api', weeklyReportRouter());
+
 app.use((req, res) => res.status(404).json({ error: `No route: ${req.method} ${req.path}` }));
 
 // Centralized error handler — catches anything asyncRoute() forwarded via next(err)
@@ -406,6 +409,8 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   await migrate();
+  await pool.query(WEEKLY_REPORT_SCHEMA);   // ← tabel laporan mingguan
+  startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
   app.listen(PORT, () => {
     console.log(`[server] Reethau Inventory API listening on http://localhost:${PORT}`);
   });

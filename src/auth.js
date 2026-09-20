@@ -8,7 +8,7 @@ const TOKEN_TTL = '7d';
 
 export function signToken(user) {
   return jwt.sign(
-    { sub: user.id, email: user.email, role: user.role },
+    { sub: user.id, email: user.email, role: user.role, assignedSite: user.assignedSite },
     JWT_SECRET,
     { expiresIn: TOKEN_TTL }
   );
