@@ -93,6 +93,11 @@ END $$;
 INSERT INTO sites (key, label, subtitle, color, image_url, is_default)
 VALUES ('wunut', 'Wunut', 'Mother Station Wunut', '#38BDF8', '/assets/images/cng-cylinder.webp', FALSE)
 ON CONFLICT (key) DO NOTHING;
+
+-- MS KHT juga belum ada di seed manapun sebelumnya.
+INSERT INTO sites (key, label, subtitle, color, image_url, is_default)
+VALUES ('kht', 'KHT', 'Mother Station KHT', '#FB923C', '/assets/images/cng-cylinder.webp', FALSE)
+ON CONFLICT (key) DO NOTHING;
 `;
 
 // ── Klasifikasi baris ke 4 seksi laporan ──────────────────────────────────
@@ -118,7 +123,8 @@ export function classifySection(row) {
 const BULAN_ID = ['januari','februari','maret','april','mei','juni','juli','agustus','september','oktober','november','desember'];
 
 /** "03 Agustus 2026" | "2026-08-03" | "3/8/2026" → "YYYY-MM-DD" | null */
-export function parseTanggal(raw) {
+/** @param {string} raw @param {string|number} [bulanHint] kolom "Bulan" eksplisit di baris yang sama (kalau ada), dipakai buat membongkar tanggal ambigu "A/B/YYYY" */
+export function parseTanggal(raw, bulanHint) {
   const s = String(raw || '').trim();
   if (!s) return null;
   let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -128,8 +134,30 @@ export function parseTanggal(raw) {
     const bulan = BULAN_ID.indexOf(m[2].toLowerCase());
     if (bulan >= 0) return `${m[3]}-${String(bulan + 1).padStart(2, '0')}-${m[1].padStart(2, '0')}`;
   }
+  // Format bergaris miring "A/B/YYYY" itu ambigu — bisa D/M/Y (mis. sheet MS
+  // KHT: "04/09/2026" = 4 September) atau M/D/Y (mis. sheet MS Blora yang
+  // diekspor dari Sheets ber-locale AS: "9/16/2026" = 16 September, bukan
+  // bulan 16). Kalau salah satu komponen > 12, itu jelas hari, jadi tak
+  // perlu ditebak. Kalau dua-duanya ≤ 12 (mis. "04/09/2026" bisa jadi 4
+  // September ATAU April 9), jangan menebak buta — kolom "Bulan" di baris
+  // yang sama SELALU ada di tab weekly IN/OUT dan jadi sumber kebenaran;
+  // baru kalau itu pun tak membantu (kosong, atau tak cocok keduanya),
+  // jatuh ke asumsi D/M/Y karena itu konvensi Indonesia yang lazim dipakai
+  // saat orang mengetik tanggal manual di sheet ini.
   m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  if (m) {
+    const a = Number(m[1]), b = Number(m[2]);
+    const tahun = m[3];
+    let hari, bulan;
+    if (a > 12 && b <= 12) { hari = a; bulan = b; }
+    else if (b > 12 && a <= 12) { bulan = a; hari = b; }
+    else {
+      const hint = Number(bulanHint);
+      if (hint >= 1 && hint <= 12 && hint === b && hint !== a) { bulan = b; hari = a; }
+      else { bulan = a; hari = b; } // default: D/M/Y
+    }
+    return `${tahun}-${String(bulan).padStart(2, '0')}-${String(hari).padStart(2, '0')}`;
+  }
   // Sel bertipe Tanggal asli (bukan teks) di Google Sheets sering diekspor CSV
   // pakai format singkat tahun 2 digit ("17/09/26") — tanpa ini kena strip
   // parseAngka() dan jadi angka sampah ("170926").
@@ -194,8 +222,9 @@ const HEADER_MAP = {
   'harga': 'harga', 'total harga': 'totalHarga', 'nilai': 'totalHarga',
   'no mr': 'noMr', 'gen bus': 'genBus',
   'status s / mr': 'statusSmr', 'status s/mr': 'statusSmr', 'status': 'statusSmr', 'kondisi': 'statusSmr',
-  'no shipment': 'noShipment', 'no wr': 'noShipment',
-  'ket': 'keterangan', 'keterangan': 'keterangan', 'ket wr': 'keterangan',
+  'status approval': 'statusSmr',
+  'no shipment': 'noShipment', 'no wr': 'noShipment', 'no ws': 'noShipment',
+  'ket': 'keterangan', 'keterangan': 'keterangan', 'ket wr': 'keterangan', 'remark': 'keterangan',
   // Kolom khusus tab "LIST ALL ASET ..." — tidak dipakai tab weekly IN/OUT.
   'jenis': 'jenis', 'merk': 'merk', 'type': 'tipe', 'tipe': 'tipe',
 };
@@ -253,7 +282,7 @@ export function rowsToRecords(rows) {
     // di tab weekly IN/OUT. parseAngka() dulu memotong itu jadi angka acak
     // ("4 Maret 2026" -> 42026). Kalau isinya berhasil dibaca sebagai tanggal,
     // pakai itu; kalau tidak, baru dianggap angka tahun biasa.
-    const tanggal = parseTanggal(o.tanggal) || tanggalDariTahun;
+    const tanggal = parseTanggal(o.tanggal, o.bulan) || tanggalDariTahun;
     const harga = parseAngka(o.harga);
     const jumlah = parseAngka(o.jumlah);
     const rec = {
@@ -298,6 +327,12 @@ const hashRow = (r) =>
 // pencocokan by-name gagal walau barangnya persis sama.
 const normNama = (s) => String(s || '').toLowerCase().replace(/"/g, 'inci').replace(/[^a-z0-9]/g, '');
 
+// Kode aset ("02.01-2026-0045") kadang tampil beda gaya tanda hubung antar
+// sheet (strip biasa vs en dash "–" hasil auto-format Sheets/Excel) walau
+// nilainya sama — semua tanda baca dibuang supaya perbandingan tidak meleset
+// gara-gara itu.
+const normKode = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
 // Fallback saat nama di dua sheet beda jauh redaksinya (mis. tambahan kode
 // SKU/reseller di ujung nama) tapi jelas barang yang sama — dicocokkan lewat
 // kemiripan kumpulan kata (Jaccard), bukan string persis.
@@ -320,17 +355,23 @@ const AMBANG_FUZZY = 0.5; // di bawah ini dianggap barang beda, tidak dipasangka
 /**
  * Sheet "LIST ALL ASET ..." tidak punya kolom harga sama sekali. Sebagai
  * pendekatan terbaik yang bisa diambil, cocokkan tiap aset ke catatan
- * pembelian di tab "... IN" (RDA/RCE) berdasarkan nama barang yang sama DAN
- * tanggal terdekat — karena satu nama barang bisa dibeli berkali-kali (mis.
- * beberapa "Kursi Kantor" identik di minggu berbeda), setiap baris pembelian
- * cuma boleh dipasangkan ke SATU aset (greedy nearest-date, sekali pakai).
- * Hasilnya SELALU ditandai sebagai estimasi (hargaEstimasi), tidak pernah
- * menimpa kolom totalHarga yang memang kosong untuk baris ASET.
+ * pembelian di tab "... IN" (RDA/RCE) — DIUTAMAKAN lewat Kode (Kode Aset),
+ * karena kode itu unik per unit fisik dan tidak kena masalah penulisan nama
+ * yang beda-beda (mis. dua "Printer Epson L3210 with Wifi" identik tapi kode
+ * asetnya beda, 0045 vs 0057 — kalau dicocokkan lewat nama, salah satu bisa
+ * "kehabisan" kandidat karena kandidatnya sudah kepakai unit lain). Kalau
+ * kode tidak ada/tidak ketemu, baru jatuh ke pencocokan by-name+tanggal
+ * seperti sebelumnya. Setiap baris pembelian cuma boleh dipasangkan ke SATU
+ * aset (sekali pakai). Hasilnya SELALU ditandai sebagai estimasi
+ * (hargaEstimasi), tidak pernah menimpa kolom totalHarga yang memang kosong
+ * untuk baris ASET.
  *
- * Dua tahap terpisah, BUKAN diselang-seling per aset:
- *  1) Exact-match (nama ternormalisasi sama persis) untuk SEMUA aset dulu.
- *  2) Fuzzy-match (kemiripan kata) untuk aset yang masih tersisa, dari sisa
- *     katalog pembelian yang belum kepakai.
+ * Tiga tahap terpisah, BUKAN diselang-seling per aset:
+ *  0) Exact-match Kode Aset — paling presisi, jadi diproses lebih dulu dan
+ *     kandidatnya "diamankan" sebelum tahap nama sempat mengambilnya.
+ *  1) Exact-match nama ternormalisasi, untuk aset yang kodenya tidak
+ *     ketemu/tidak ada, dari sisa katalog pembelian yang belum kepakai.
+ *  2) Fuzzy-match (kemiripan kata), untuk sisa aset yang masih tersisa.
  * Kalau digabung dalam satu putaran, aset yang diproses lebih dulu bisa
  * "mencuri" via fuzzy kandidat pembelian yang sebetulnya exact-match milik
  * aset lain yang belum diproses — itu pernah kejadian waktu diuji.
@@ -340,30 +381,49 @@ async function attachEstimasiHarga(rowsHasil) {
   if (!asetRows.length) return;
   const sites = [...new Set(asetRows.map((r) => r.site))];
   const { rows: pembelian } = await query(
-    `SELECT site, tanggal, nama_barang, total_harga FROM weekly_report_rows
+    `SELECT site, tanggal, kode, nama_barang, total_harga FROM weekly_report_rows
       WHERE direction = 'IN' AND site = ANY($1::text[]) AND total_harga > 0`,
     [sites]
   );
-  const pool = {};
+  const poolNama = {};
+  const poolKode = {};
   const semuaPembelian = [];
   for (const p of pembelian) {
     const k = {
-      site: p.site, namaBarang: p.nama_barang,
+      site: p.site, kode: p.kode, namaBarang: p.nama_barang,
       tanggal: p.tanggal ? new Date(p.tanggal).getTime() : null,
       harga: Number(p.total_harga),
       used: false,
     };
-    (pool[`${p.site}|${normNama(p.nama_barang)}`] ||= []).push(k);
+    (poolNama[`${p.site}|${normNama(p.nama_barang)}`] ||= []).push(k);
+    if (p.kode && normKode(p.kode)) (poolKode[`${p.site}|${normKode(p.kode)}`] ||= []).push(k);
     semuaPembelian.push(k);
   }
   // Urut berdasarkan tanggal supaya assignment deterministik & tidak
   // tergantung urutan hasil query.
   const asetUrut = [...asetRows].sort((a, b) => String(a.tanggal || '').localeCompare(String(b.tanggal || '')));
-  const belumKetemu = [];
 
-  // Tahap 1: exact-match untuk semua aset.
+  // Tahap 0: exact-match Kode Aset — jalan duluan, prioritas tertinggi.
+  const belumKodeOrTanpaKode = [];
   for (const a of asetUrut) {
-    const kandidat = pool[`${a.site}|${normNama(a.namaBarang)}`];
+    const kodeA = normKode(a.kode);
+    const kandidatKode = kodeA ? poolKode[`${a.site}|${kodeA}`] : null;
+    if (!kandidatKode || !kandidatKode.length) { belumKodeOrTanpaKode.push(a); continue; }
+    const tglAset = a.tanggal ? new Date(a.tanggal).getTime() : null;
+    let terbaik = null, jarakTerbaik = Infinity;
+    for (const k of kandidatKode) {
+      if (k.used) continue;
+      const jarak = (tglAset != null && k.tanggal != null) ? Math.abs(tglAset - k.tanggal) : Number.MAX_SAFE_INTEGER;
+      if (jarak < jarakTerbaik) { jarakTerbaik = jarak; terbaik = k; }
+    }
+    if (terbaik) { terbaik.used = true; a.hargaEstimasi = terbaik.harga; }
+    else belumKodeOrTanpaKode.push(a); // kode cocok tapi kandidatnya sudah kepakai unit lain
+  }
+
+  // Tahap 1: exact-match nama, hanya untuk aset yang belum dapat dari kode.
+  const belumKetemu = [];
+  for (const a of belumKodeOrTanpaKode) {
+    const kandidat = poolNama[`${a.site}|${normNama(a.namaBarang)}`];
     if (!kandidat || !kandidat.length) { belumKetemu.push(a); continue; }
     const tglAset = a.tanggal ? new Date(a.tanggal).getTime() : null;
     let terbaik = null, jarakTerbaik = Infinity;
@@ -408,6 +468,13 @@ async function fetchTabCsv(sheetId, tabName) {
 
 const directionOf = (tab) => {
   if (/aset/i.test(tab)) return 'ASET';
+  // Beberapa site pakai penamaan Bahasa Indonesia ("Barang Masuk - RDA SETU"
+  // / "Barang Keluar - RDA SETU") alih-alih pola "... RDA IN"/"... RDA OUT"
+  // ala MS Wunut. Kata Indonesia dicek lebih dulu karena lebih spesifik;
+  // "Masuk"/"Keluar" tidak pernah mengandung kata "in" secara kebetulan,
+  // jadi urutan pengecekan ini aman untuk kedua pola.
+  if (/\bmasuk\b/i.test(tab)) return 'IN';
+  if (/\bkeluar\b/i.test(tab)) return 'OUT';
   return /\bin\b/i.test(tab) ? 'IN' : 'OUT';
 };
 
