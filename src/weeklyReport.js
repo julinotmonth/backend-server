@@ -317,10 +317,34 @@ export function rowsToRecords(rows) {
   return out;
 }
 
-/** Kunci dedup — import ulang sheet yang sama tidak menggandakan baris. */
+/** Kunci dedup — import ulang sheet yang sama tidak menggandakan baris.
+ * PENTING: tidak menyertakan posisi baris, jadi beberapa baris sheet yang
+ * kebetulan identik di 7 kolom ini (umum terjadi — satu MR sering memesan
+ * item kecil yang sama berkali-kali sebagai baris terpisah, mis. "Gelas
+ * Ukur Takar SS 2 liter" 10x dengan MR yang sama) akan menghasilkan hash
+ * SAMA. Fungsi ini sendiri tidak cukup untuk dedup yang aman — lihat
+ * dedupeHashes() di bawah, yang menambahkan penomoran urutan supaya
+ * baris-baris kembar itu tetap dianggap baris berbeda, bukan saling
+ * menimpa (data hilang diam-diam saat sync). */
 const hashRow = (r) =>
   [r.tanggal, r.kode, r.namaBarang, r.jumlah, r.alokasi, r.noMr, r.totalHarga]
     .join('|').toLowerCase().replace(/\s+/g, ' ').slice(0, 300);
+
+/** Menomori kemunculan ke-2, ke-3, dst dari hash dasar yang sama supaya
+ * baris kembar yang benar-benar identik (lihat catatan di hashRow di atas)
+ * tetap dapat row_hash unik masing-masing, bukan saling menimpa lewat
+ * ON CONFLICT. Penomoran mengikuti URUTAN baris di sheet, jadi tetap stabil
+ * (idempotent) selama urutan barisnya tidak berubah antar-sync — sync ulang
+ * sheet yang sama persis tidak akan menggandakan baris. */
+function dedupeHashes(records) {
+  const seen = new Map();
+  return records.map((r) => {
+    const base = hashRow(r);
+    const n = (seen.get(base) || 0) + 1;
+    seen.set(base, n);
+    return n === 1 ? base : `${base}|#${n}`;
+  });
+}
 
 // Menyamakan gaya penulisan ukuran inci yang sering beda antar-sheet, mis.
 // `8,7"` di sheet aset vs `8,7 Inci` di catatan pembelian — tanpa ini,
@@ -457,7 +481,7 @@ export function extractSheetId(input) {
   return m ? m[1] : (/^[a-zA-Z0-9-_]{20,}$/.test(s) ? s : null);
 }
 
-async function fetchTabCsv(sheetId, tabName) {
+export async function fetchTabCsv(sheetId, tabName) {
   const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}`;
   const res = await fetch(url, { redirect: 'follow' });
   if (!res.ok) throw Object.assign(new Error(`Gagal membaca tab "${tabName}" (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
@@ -522,8 +546,10 @@ export const WeeklyReports = {
     const direction = directionOf(tab);
     let inserted = 0, updated = 0;
     const hashesInBatch = [];
-    for (const r of records) {
-      const hash = hashRow(r);
+    const hashes = dedupeHashes(records);
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      const hash = hashes[i];
       hashesInBatch.push(hash);
       const { rows } = await query(
         `INSERT INTO weekly_report_rows

@@ -7,6 +7,7 @@ import { migrate } from './migrate.js';
 import { Users, Sites, Categories, SpareParts, Logs, Gallery, FixedAssets, WorkOrders } from './repo.js';
 import { signToken, requireAuth, requireSuperAdmin } from './auth.js';
 import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weeklyReport.js';
+import { PICA_SCHEMA, picaRouter, startPicaAutoSync } from './pica.js';
 
 const PORT = process.env.PORT || 4000;
 const DEFAULT_SITE_KEYS = ['bekasi', 'indramayu', 'blora', 'setu'];
@@ -398,6 +399,7 @@ app.get('/api/reports/summary', requireAuth, asyncRoute(async (_req, res) => {
 }));
 
 app.use('/api', weeklyReportRouter());
+app.use('/api', picaRouter());
 
 app.use((req, res) => res.status(404).json({ error: `No route: ${req.method} ${req.path}` }));
 
@@ -410,7 +412,9 @@ app.use((err, _req, res, _next) => {
 async function start() {
   await migrate();
   await pool.query(WEEKLY_REPORT_SCHEMA);   // ← tabel laporan mingguan
+  await pool.query(PICA_SCHEMA);            // ← tabel PICA tracker
   startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
+  startPicaAutoSync();                       // ← idem, untuk PICA
   app.listen(PORT, () => {
     console.log(`[server] Reethau Inventory API listening on http://localhost:${PORT}`);
   });

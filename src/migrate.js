@@ -37,7 +37,10 @@ async function seedSites() {
 
   const sites = [
     ['bekasi', 'Bekasi', 'Mother Station & Workshop', '#00D084', '/assets/images/cng-cylinder.webp'],
-    ['indramayu', 'Indramayu', 'Daughter Station & Depot', '#60A5FA', '/assets/images/distribution-truck.webp'],
+    // Key tetap "indramayu" (banyak referensi lama: spare_parts, fixed_assets,
+    // activity_logs, SITE_KELOMPOK_KEGIATAN di WeeklyReportView) — cuma label
+    // tampilan yang berubah jadi "WS Dawuan".
+    ['indramayu', 'WS Dawuan', 'Workshop Armada Kendaraan', '#60A5FA', '/assets/images/distribution-truck.webp'],
     ['blora', 'Blora', 'Wellhead & Processing Plant', '#FBBF24', '/assets/images/cng-pipe.webp'],
     ['setu', 'Setu', 'Compressor Station & Fleet Room', '#C084FC', '/assets/images/setu/setu-02.webp'],
   ];
