@@ -87,54 +87,105 @@ function previewRows(rows, n = 20) {
   }).join('\n');
 }
 
+/** Setelah kolom tanggal ditentukan dari LABEL header, dicek ulang terhadap
+ * ISI baris data sungguhan — bukan cuma dipercaya dari posisi header.
+ * Kenapa: pernah kejadian nyata di sheet PICA MS KHT, kolom "DATE" di baris
+ * header ternyata TIDAK sejajar dengan nilai tanggal aslinya (nilai
+ * tanggalnya konsisten muncul satu kolom lebih kiri di SEMUA baris data,
+ * kemungkinan besar gara-gara sel gabung di baris judul yang menggeser
+ * posisi kolom hanya di baris header, tidak di baris data). Dicoba 3
+ * kandidat (posisi header apa adanya, satu kolom kiri, satu kolom kanan)
+ * lalu dipilih yang paling banyak menghasilkan tanggal valid dari sampel
+ * baris data — bukan menebak buta, divalidasi ke data sungguhan. */
+function pilihKolomTanggal(rows, dataStartIdx, idxHeader, jumlahSampel = 15) {
+  const skor = (idx) => {
+    if (idx < 0 || idx >= (rows[dataStartIdx]?.length ?? 0)) return -1;
+    let n = 0;
+    for (let i = dataStartIdx; i < Math.min(rows.length, dataStartIdx + jumlahSampel); i++) {
+      if (parseTanggalPica(rows[i]?.[idx])) n++;
+    }
+    return n;
+  };
+  const kandidat = [idxHeader, idxHeader - 1, idxHeader + 1];
+  let terbaik = idxHeader, skorTerbaik = -1;
+  for (const idx of kandidat) {
+    const s = skor(idx);
+    if (s > skorTerbaik) { skorTerbaik = s; terbaik = idx; }
+  }
+  return skorTerbaik > 0 ? terbaik : idxHeader;
+}
+
 /** CSV mentah tab PICA → daftar isu. Kolom dicari lewat header (bukan huruf
  * kolom tetap) supaya tahan kalau sheet ditambah/dikurangi kolom minggu. */
 export function parsePicaCsv(csvText) {
   const rows = parseCsv(csvText);
 
+  // Anchor dicari lewat PROBLEM + DESCRIPTION saja (bukan +NO seperti
+  // sebelumnya). Kenapa: pernah kejadian nyata (sheet PICA MS KHT) label
+  // "NO" ternyata sama sekali tidak ada di baris header hasil ekspor CSV
+  // (gviz) — entah karena sel gabung di baris judul di atasnya menyerap
+  // kolom itu, entah sebab lain di sheet aslinya. PROBLEM+DESCRIPTION jauh
+  // lebih jarang hilang begini, jadi dipakai sebagai jangkar yang lebih
+  // stabil; "NO" yang hilang ditolerir (lihat noIdx di bawah), bukan bikin
+  // gagal total.
   const headIdx = rows.findIndex((r) => {
     const n = r.map(norm);
-    return n.includes('no') && n.includes('problem') && n.includes('description');
+    return n.includes('problem') && n.includes('description');
   });
   if (headIdx < 0) {
     throw Object.assign(new Error(
-      `Tidak menemukan baris header (kolom "NO"/"PROBLEM"/"DESCRIPTION") di sheet ini. ` +
+      `Tidak menemukan baris header (kolom "PROBLEM"/"DESCRIPTION") di sheet ini. ` +
       `Isi yang benar-benar terbaca (20 baris pertama):\n${previewRows(rows)}`
     ), { status: 400 });
   }
 
-  const header = rows[headIdx].map(norm);
-  const weekHeader = rows[headIdx + 1] || [];
+  const headerRaw = rows[headIdx];
+  const header = headerRaw.map(norm);
   const col = (label) => header.indexOf(label);
 
-  const noIdx = col('no');
-  const dateIdx = col('date');
+  let noIdx = col('no');
+  const dateIdxHeader = col('date');
   const problemIdx = col('problem');
   const identIdx = col('identification');
   const descIdx = col('description');
   let targetIdx = header.findIndex((h) => h === 'target date');
   const picIdx = col('pic');
   const statusIdx = col('status');
-  if (noIdx < 0 || problemIdx < 0 || descIdx < 0) {
+  if (problemIdx < 0 || descIdx < 0) {
     throw Object.assign(new Error(
-      `Baris header ditemukan di baris ${headIdx + 1}, tapi gagal memetakan kolom NO/PROBLEM/DESCRIPTION. ` +
-      `Isi baris header: ${rows[headIdx].map((c, ci) => `[${ci}]${c}`).filter((_, ci) => rows[headIdx][ci]).join('  ')}`
+      `Baris header ditemukan di baris ${headIdx + 1}, tapi gagal memetakan kolom PROBLEM/DESCRIPTION. ` +
+      `Isi baris header: ${headerRaw.map((c, ci) => `[${ci}]${c}`).filter((_, ci) => headerRaw[ci]).join('  ')}`
     ), { status: 400 });
   }
   if (targetIdx < 0) targetIdx = header.length; // sheet tanpa kolom Target Date
 
+  const dataStartIdx = headIdx + 1;
+  // Kolom DATE divalidasi ulang ke data sungguhan, bukan cuma dipercaya dari
+  // posisi header — pernah kejadian nyata di sheet PICA MS KHT, nilai
+  // tanggal aslinya konsisten muncul satu kolom lebih kiri dari label
+  // header "DATE" di SEMUA baris data (kemungkinan besar gara-gara sel
+  // gabung di baris judul yang menggeser posisi kolom hanya di baris
+  // header, tidak di baris data). Dicoba posisi header apa adanya, satu
+  // kolom kiri, satu kolom kanan — dipilih yang paling banyak menghasilkan
+  // tanggal valid dari sampel baris data.
+  const dateIdx = dateIdxHeader >= 0 ? pilihKolomTanggal(rows, dataStartIdx, dateIdxHeader) : -1;
+
   // Kolom antara DESCRIPTION dan TARGET DATE = kolom catatan mingguan
-  // ("Week 34", "Week 35", ...), labelnya diambil dari baris tepat di
-  // bawah header utama.
+  // ("Week 34", "Week 35", ...), labelnya diambil dari baris header yang
+  // sama (bukan baris di bawahnya — di sheet PICA nyata, label minggu
+  // ternyata sebaris dengan PROBLEM/DESCRIPTION, bukan di baris terpisah).
   const weekCols = [];
   for (let c = descIdx + 1; c < targetIdx; c++) {
-    const label = String(weekHeader[c] || '').trim();
+    if (c === dateIdx) continue; // jangan sampai kolom Date ikut kehitung minggu
+    const label = String(headerRaw[c] || '').trim();
     if (label) weekCols.push({ c, label });
   }
 
   const out = [];
-  for (const r of rows.slice(headIdx + 2)) {
-    const noVal = String(r[noIdx] || '').trim();
+  let nomorUrut = 0;
+  for (const r of rows.slice(dataStartIdx)) {
+    nomorUrut++;
+    const noVal = noIdx >= 0 ? String(r[noIdx] || '').trim() : '';
     const problemVal = String(r[problemIdx] || '').trim();
     if (!noVal && !problemVal) continue; // baris kosong
 
@@ -144,8 +195,8 @@ export function parsePicaCsv(csvText) {
     const latest = updates[updates.length - 1] || null;
 
     out.push({
-      no: noVal,
-      tanggal: parseTanggalPica(r[dateIdx]),
+      no: noVal || String(nomorUrut),
+      tanggal: dateIdx >= 0 ? parseTanggalPica(r[dateIdx]) : null,
       problem: problemVal,
       identifikasi: String(r[identIdx] || '').trim(),
       deskripsi: String(r[descIdx] || '').trim(),
@@ -159,7 +210,7 @@ export function parsePicaCsv(csvText) {
   }
   if (!out.length) {
     throw Object.assign(new Error(
-      `Header NO/PROBLEM/DESCRIPTION ditemukan di baris ${headIdx + 1} (kolom ${noIdx}/${problemIdx}/${descIdx}), ` +
+      `Header PROBLEM/DESCRIPTION ditemukan di baris ${headIdx + 1} (kolom ${problemIdx}/${descIdx}), ` +
       `tapi tidak ada baris di bawahnya yang punya isi di kolom NO atau PROBLEM. ` +
       `Isi yang benar-benar terbaca mulai baris ${headIdx + 1} (20 baris):\n${previewRows(rows.slice(headIdx), 20)}`
     ), { status: 400 });
