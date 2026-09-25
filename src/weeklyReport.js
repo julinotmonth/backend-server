@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS weekly_report_rows (
   merk           TEXT NOT NULL DEFAULT '',
   tipe           TEXT NOT NULL DEFAULT '',
   section        TEXT NOT NULL DEFAULT 'MAINT'
-                   CHECK (section IN ('MAINT','OH','OLI','LAIN')),
+                   CHECK (section IN ('MAINT','OH','OLI','LAIN','ISOTANK')),
   imported_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   imported_by    TEXT,
   UNIQUE (site, direction, row_hash)
@@ -87,6 +87,18 @@ BEGIN
     CHECK (direction IN ('IN','OUT','ASET'));
 END $$;
 
+-- Sama seperti di atas, tapi untuk kolom "section" — seksi ke-5 "ISOTANK"
+-- ditambahkan belakangan (khusus LNG Sangkulirang, yang mengelola kontainer
+-- ISO Tank, sesuatu yang tidak ada di site CNG lain).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'weekly_report_rows_section_check') THEN
+    ALTER TABLE weekly_report_rows DROP CONSTRAINT weekly_report_rows_section_check;
+  END IF;
+  ALTER TABLE weekly_report_rows ADD CONSTRAINT weekly_report_rows_section_check
+    CHECK (section IN ('MAINT','OH','OLI','LAIN','ISOTANK'));
+END $$;
+
 -- MS Wunut belum ada di seed awal (src/migrate.js hanya menanam bekasi,
 -- indramayu, blora, setu). Ditanam di sini supaya laporan mingguan punya
 -- site-nya tanpa perlu mengubah migrasi lama.
@@ -98,22 +110,38 @@ ON CONFLICT (key) DO NOTHING;
 INSERT INTO sites (key, label, subtitle, color, image_url, is_default)
 VALUES ('kht', 'KHT', 'Mother Station KHT', '#FB923C', '/assets/images/cng-cylinder.webp', FALSE)
 ON CONFLICT (key) DO NOTHING;
+
+-- LNG Sangkulirang — beda lini produk dari CNG (Wunut/Setu/Blora/KHT),
+-- label pakai prefix "LNG" sendiri (lihat labelPenuh() di
+-- WeeklyReportView.tsx yang sudah dibuat mengenali prefix ini juga).
+INSERT INTO sites (key, label, subtitle, color, image_url, is_default)
+VALUES ('sangkulirang', 'LNG Sangkulirang', 'Fasilitas LNG Sangkulirang', '#A78BFA', '/assets/images/cng-cylinder.webp', FALSE)
+ON CONFLICT (key) DO NOTHING;
 `;
 
-// ── Klasifikasi baris ke 4 seksi laporan ──────────────────────────────────
+// ── Klasifikasi baris ke 5 seksi laporan ──────────────────────────────────
 const ALOKASI_LAIN = [
   'jasa service & repair', 'jasa new instalasi', 'jasa kalibrasi',
   'sedot limbah b3', 'jasa analisa gas', 'jasa analisa oli', 'others', 'other',
 ];
 
+// Kode kontainer ISO Tank mengikuti standar internasional ISO 6346: 4 huruf
+// (3 huruf kode pemilik + 1 huruf kategori, biasanya "U") diikuti 7 angka
+// (6 digit nomor seri + 1 digit cek), mis. "RDAU1581209". Dipakai untuk
+// mendeteksi baris LNG Sangkulirang yang alokasinya berupa unit ISO Tank,
+// bukan nama mesin/kegiatan seperti site lain.
+const KODE_ISO_TANK = /^[A-Z]{4}\d{7}$/;
+
 export function classifySection(row) {
-  const alokasi = String(row.alokasi || '').trim().toLowerCase();
+  const alokasiAsli = String(row.alokasi || '').trim();
+  const alokasi = alokasiAsli.toLowerCase();
   const nama = String(row.namaBarang || '').toLowerCase();
   const ket = `${row.detailAlokasi || ''} ${row.keterangan || ''}`.toLowerCase();
 
   // Urutan penting: baris berbasis jasa / OTHERS selalu masuk Lain-Lain,
   // meski keterangannya menyebut overhaul — sama seperti template Excel.
   if (ALOKASI_LAIN.includes(alokasi) || alokasi.startsWith('jasa')) return 'LAIN';
+  if (KODE_ISO_TANK.test(alokasiAsli.toUpperCase().replace(/\s+/g, ''))) return 'ISOTANK';
   if (/overhaul|overhold|\boh\b/.test(ket)) return 'OH';
   if (/\boli\b|pelumas|lubric/.test(nama)) return 'OLI';
   return 'MAINT';
