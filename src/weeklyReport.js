@@ -132,7 +132,7 @@ const ALOKASI_LAIN = [
 // bukan nama mesin/kegiatan seperti site lain.
 const KODE_ISO_TANK = /^[A-Z]{4}\d{7}$/;
 
-export function classifySection(row) {
+export function classifySection(row, site) {
   const alokasiAsli = String(row.alokasi || '').trim();
   const alokasi = alokasiAsli.toLowerCase();
   const nama = String(row.namaBarang || '').toLowerCase();
@@ -142,6 +142,14 @@ export function classifySection(row) {
   // meski keterangannya menyebut overhaul — sama seperti template Excel.
   if (ALOKASI_LAIN.includes(alokasi) || alokasi.startsWith('jasa')) return 'LAIN';
   if (KODE_ISO_TANK.test(alokasiAsli.toUpperCase().replace(/\s+/g, ''))) return 'ISOTANK';
+  // LNG Sangkulirang: sheet rekapnya sendiri ("Week LNG Sngkurilang") cuma
+  // punya DUA kelompok — ISO Tank dan Lain-Lain — semua kategori lain (PRS,
+  // Vaporizer, Tools Mekanik, Control Panel, Skid Pump, HSE, Reach Staker,
+  // Crane, plat kendaraan, HILUX, OTHER) ada di bawah "Lain-Lain" di sana,
+  // bukan dipecah jadi Part Maintenance/OH/Consumption OLI seperti Wunut.
+  // Tanpa pengecualian ini, semua kategori itu jatuh ke default MAINT di
+  // bawah karena tak satu pun cocok kata kunci overhaul/oli/jasa.
+  if (site === 'sangkulirang') return 'LAIN';
   if (/overhaul|overhold|\boh\b/.test(ket)) return 'OH';
   if (/\boli\b|pelumas|lubric/.test(nama)) return 'OLI';
   return 'MAINT';
@@ -276,7 +284,7 @@ export function parseCsv(text) {
 }
 
 /** Baris CSV mentah → record ternormalisasi. Header dicari otomatis. */
-export function rowsToRecords(rows) {
+export function rowsToRecords(rows, site) {
   const headIdx = rows.findIndex((r) => r.some((c) => ['nama barang', 'nama aset', 'nama item'].includes(norm(c))));
   if (headIdx < 0) return [];
   const cols = rows[headIdx].map((c) => HEADER_MAP[norm(c)] || null);
@@ -339,7 +347,7 @@ export function rowsToRecords(rows) {
       merk: String(o.merk || '').trim(),
       tipe: String(o.tipe || '').trim(),
     };
-    rec.section = classifySection(rec);
+    rec.section = classifySection(rec, site);
     out.push(rec);
   }
   return out;
@@ -675,6 +683,30 @@ export const WeeklyReports = {
     await query('UPDATE weekly_report_sources SET last_sync_at = NOW(), last_status = $2 WHERE site = $1', [site, status]);
   },
 
+  /**
+   * Hapus baris yang "yatim" — source_tab-nya sudah tidak ada lagi di daftar
+   * tab yang dikonfigurasi untuk site ini. Dipanggil sekali di akhir tiap
+   * putaran sync (setelah semua tab di src.tabs diproses), BUKAN di dalam
+   * upsertMany per-tab, karena cakupannya beda: upsertMany cuma tahu baris
+   * dalam SATU tab yang lagi disync, sedangkan di sini kita perlu tahu
+   * SEMUA tab yang sekarang dikonfigurasi untuk site itu.
+   *
+   * Kasus nyata yang memicu ini: site "sangkulirang" sempat (secara tidak
+   * sengaja) ter-sync dari sheet/tab site lain sebelum sumbernya dibetulkan
+   * ke sheet LNG Sangkulirang yang benar. Baris-baris lama itu punya
+   * source_tab yang beda dari "In"/"Out" yang sekarang dikonfigurasi, jadi
+   * tidak pernah tersentuh oleh pembersihan per-tab di upsertMany — baris
+   * itu numpuk terus dan ikut tampil di laporan site yang salah.
+   */
+  async hapusTabUsang(site, tabsAktif) {
+    if (!tabsAktif || !tabsAktif.length) return 0;
+    const { rowCount } = await query(
+      `DELETE FROM weekly_report_rows WHERE site = $1 AND NOT (source_tab = ANY($2::text[]))`,
+      [site, tabsAktif]
+    );
+    return rowCount;
+  },
+
   async volumes(site, tahun) {
     const { rows } = await query(
       'SELECT minggu, m3 FROM weekly_sales_volume WHERE site = $1 AND tahun = $2 ORDER BY minggu', [site, Number(tahun)]);
@@ -737,7 +769,7 @@ export function weeklyReportRouter() {
         const csv = await fetchTabCsv(src.sheetId, tab);
         const parsed = parseCsv(csv);
         assertDirectionMatches(tab, parsed);
-        const records = rowsToRecords(parsed);
+        const records = rowsToRecords(parsed, site);
         const stat = await WeeklyReports.upsertMany(site, tab, records, req.auth.email);
         hasil.push({ tab, ...stat });
       } catch (err) {
@@ -745,8 +777,9 @@ export function weeklyReportRouter() {
       }
     }
     const gagal = hasil.filter((h) => h.error).length;
+    const dibuang = await WeeklyReports.hapusTabUsang(site, src.tabs);
     await WeeklyReports.markSync(site, gagal ? `${gagal} tab gagal` : 'OK');
-    res.json({ site, syncedAt: new Date().toISOString(), hasil });
+    res.json({ site, syncedAt: new Date().toISOString(), hasil, dibuang });
   }));
 
   // Import manual: frontend mengirim CSV hasil upload .xlsx/.csv.
@@ -754,7 +787,7 @@ export function weeklyReportRouter() {
     const { site, tab, csv } = req.body || {};
     siteGuard(req, site);
     if (!site || !csv) return res.status(400).json({ error: 'Site dan isi file wajib diisi.' });
-    const records = rowsToRecords(parseCsv(csv));
+    const records = rowsToRecords(parseCsv(csv), site);
     if (!records.length) return res.status(400).json({ error: 'Tidak ada baris valid — pastikan ada kolom "Nama Barang".' });
     res.json(await WeeklyReports.upsertMany(site, tab || 'UPLOAD', records, req.auth.email));
   }));
@@ -786,14 +819,16 @@ export function startAutoSync(intervalMs = 5 * 60 * 1000) {
     try {
       const { rows } = await query('SELECT site, sheet_id, tabs FROM weekly_report_sources WHERE auto_sync = TRUE');
       for (const s of rows) {
-        for (const tab of (s.tabs || '').split('|').filter(Boolean)) {
+        const tabsAktif = (s.tabs || '').split('|').filter(Boolean);
+        for (const tab of tabsAktif) {
           try {
             const parsed = parseCsv(await fetchTabCsv(s.sheet_id, tab));
             assertDirectionMatches(tab, parsed);
-            const records = rowsToRecords(parsed);
+            const records = rowsToRecords(parsed, s.site);
             await WeeklyReports.upsertMany(s.site, tab, records, 'auto-sync');
           } catch (err) { console.warn(`[weekly-sync] ${s.site}/${tab}:`, err.message); }
         }
+        await WeeklyReports.hapusTabUsang(s.site, tabsAktif);
         await WeeklyReports.markSync(s.site, 'OK (auto)');
       }
     } catch (err) { console.error('[weekly-sync]', err.message); }
