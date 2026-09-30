@@ -129,22 +129,39 @@ export function parseWorkTargetCsv(csvText) {
     ), { status: 400 });
   }
 
-  // "Target" ada di baris DI BAWAH header utama (sub-header di bawah grup
-  // "[Bulan]" yang merged), begitu juga nama-nama bulan ada satu baris lagi
-  // di bawahnya — dicari di headIdx s/d headIdx+3 (bukan cuma satu baris
-  // tetap) supaya tahan kalau jumlah baris sub-header sheet berubah.
+  // Header sheet ini bertingkat (baris "[Bulan]" merged → sub-header "Target"
+  // /"Pencapaian" → nama bulan). Hasil ekspor CSV Google (gviz) BISA menggabung
+  // baris-baris header itu jadi SATU label per kolom — mis. kolom Target
+  // berlabel "[Bulan] Target" dan kolom Januari berlabel "Pencapaian Jan"
+  // (bukan "Target" dan "Jan" polos). Kalau dicocokkan persis, Target dan
+  // Januari lolos tak terbaca (kejadian nyata: semua baris jadi "belum ada
+  // data" dan grafik mulai dari Februari). Makanya dicocokkan per KATA, bukan
+  // per isi sel utuh — jalan untuk kedua bentuk (label tergabung maupun
+  // header bertingkat asli di baris-baris terpisah).
+  const kata = (c) => norm(c).split(/[^a-z0-9]+/).filter(Boolean);
+  const tetap = new Set([noIdx, objectiveIdx, strategiIdx, activityIdx, picIdx, keteranganIdx].filter((i) => i >= 0));
+  const bulanDariSel = (c) => {
+    const k = kata(c);
+    if (!k.length || k.length > 3) return null; // kalimat panjang bukan label bulan
+    for (const t of k) if (BULAN_KANON[t]) return BULAN_KANON[t];
+    return null;
+  };
   let targetIdx = -1;
   const kandidatBulan = []; // { rowIdx, cols: [{c, label}] }
   for (let r = headIdx; r <= Math.min(headIdx + 3, rows.length - 1); r++) {
     const baris = rows[r] || [];
     if (targetIdx < 0) {
-      const idx = baris.findIndex((c) => norm(c) === 'target');
+      const idx = baris.findIndex((c, ci) => {
+        if (tetap.has(ci) || ci <= picIdx) return false;
+        const k = kata(c);
+        return k.length > 0 && k.length <= 3 && k.includes('target');
+      });
       if (idx >= 0) targetIdx = idx;
     }
     const cols = [];
     baris.forEach((c, ci) => {
-      if (ci === keteranganIdx || ci === noIdx || ci === objectiveIdx || ci === strategiIdx || ci === activityIdx || ci === picIdx) return;
-      const b = kanonBulan(c);
+      if (tetap.has(ci)) return;
+      const b = bulanDariSel(c);
       if (b) cols.push({ c: ci, label: b });
     });
     if (cols.length) kandidatBulan.push({ rowIdx: r, cols });
@@ -160,6 +177,9 @@ export function parseWorkTargetCsv(csvText) {
   // yang mirip nama bulan).
   kandidatBulan.sort((a, b) => b.cols.length - a.cols.length);
   const { rowIdx: barisBulan, cols: kolomBulan } = kandidatBulan[0];
+  // Cadangan: kalau label "Target" tetap tak ketemu, kolom Target selalu
+  // tepat di sebelah kiri kolom bulan pertama (persis susunan sheet aslinya).
+  if (targetIdx < 0 && kolomBulan[0].c - 1 > picIdx) targetIdx = kolomBulan[0].c - 1;
 
   const dataStartIdx = barisBulan + 1;
   const out = [];
@@ -209,6 +229,10 @@ export function parseWorkTargetCsv(csvText) {
       `baris data di bawahnya yang punya isi di kolom Strategi/Guideline. Isi yang terbaca:\n${previewRows(rows.slice(barisBulan), 15)}`
     ), { status: 400 });
   }
+  out.meta = {
+    barisHeader: headIdx + 1, targetIdx,
+    bulan: kolomBulan.map((k) => `${k.label}@${k.c}`),
+  };
   return out;
 }
 
@@ -337,7 +361,7 @@ export function workTargetRouter() {
       const records = parseWorkTargetCsv(csv);
       const stat = await WorkTargetItems.upsertMany(records, req.auth.email);
       await WorkTargetItems.markSync('OK');
-      res.json({ syncedAt: new Date().toISOString(), ...stat });
+      res.json({ syncedAt: new Date().toISOString(), ...stat, terbaca: records.meta });
     } catch (err) {
       await WorkTargetItems.markSync(err.message);
       res.status(err.status || 500).json({ error: err.message });
