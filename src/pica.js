@@ -9,6 +9,7 @@ import express from 'express';
 import { query } from './db.js';
 import { requireAuth } from './auth.js';
 import { parseCsv, parseTanggal } from './weeklyReport.js';
+import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────
 export const PICA_SCHEMA = `
@@ -248,10 +249,33 @@ async function fetchCsvByGid(sheetId, gid) {
 }
 
 // ── Repo ──────────────────────────────────────────────────────────────────
+// Kolom yang TIDAK ikut membentuk row_hash (no|tanggal|problem): edit di sheet =
+// update di tempat. Urutan = urutan penting untuk ditampilkan di notifikasi.
+const KOLOM_PICA = [
+  { lama: 'status', baru: 'status', label: 'Status' },
+  { lama: 'pic', baru: 'pic', label: 'PIC' },
+  { lama: 'latest_week', baru: 'latestWeek', label: 'Update minggu' },
+  { lama: 'latest_note', baru: 'latestNote', label: 'Catatan terbaru' },
+  { lama: 'target_date', baru: 'targetDate', label: 'Target date', tipe: 'tanggal' },
+  { lama: 'identifikasi', baru: 'identifikasi', label: 'Identification', ringkas: true },
+  { lama: 'deskripsi', baru: 'deskripsi', label: 'Description', ringkas: true },
+];
+const KOLOM_HASH_PICA = [
+  { lama: 'problem', baru: 'problem', label: 'Problem' },
+  { lama: 'tanggal', baru: 'tanggal', label: 'Tanggal', tipe: 'tanggal' },
+];
+const namaIsu = (no, problem) => (no ? `${no}. ${problem}` : problem);
+
 export const PicaItems = {
   async upsertMany(site, records, importedBy) {
     let inserted = 0, updated = 0;
     const hashesInBatch = [];
+    // Isi lama (sebelum ditimpa) — dasar mendeteksi perubahan nyata untuk notifikasi.
+    const { rows: lamaRows } = await query(
+      `SELECT row_hash, no, tanggal, problem, identifikasi, deskripsi, target_date, pic, status, latest_week, latest_note
+         FROM pica_items WHERE site = $1`, [site]);
+    const lama = new Map(lamaRows.map((x) => [x.row_hash, x]));
+    const barisBaru = [], ubahDiTempat = [];
     for (const r of records) {
       const hash = hashRow(r);
       hashesInBatch.push(hash);
@@ -272,6 +296,12 @@ export const PicaItems = {
          JSON.stringify(r.updates), r.latestWeek, r.latestNote, importedBy]
       );
       rows[0].is_new ? inserted++ : updated++;
+      const ada = lama.get(hash);
+      if (!ada) barisBaru.push(r);
+      else {
+        const perubahan = bandingkan(ada, r, KOLOM_PICA);
+        if (perubahan.length) ubahDiTempat.push({ pic: r.pic || ada.pic, nama: namaIsu(r.no, r.problem), ket: r.status, perubahan });
+      }
     }
     let removed = 0;
     if (hashesInBatch.length > 0) {
@@ -280,6 +310,26 @@ export const PicaItems = {
         [site, hashesInBatch]
       );
       removed = res.rowCount;
+    }
+    // Log perubahan untuk notifikasi (sinkron pertama = baseline, tidak dicatat).
+    if (lama.size > 0) {
+      const batch = new Set(hashesInBatch);
+      const hilang = hashesInBatch.length > 0 ? [...lama].filter(([h]) => !batch.has(h)).map(([, v]) => v) : [];
+      const kunciRec = (b) => [b.no, b.tanggal || ''].join('|').toLowerCase();
+      const kunciDb = (l) => [l.no, l.tanggal ? String(l.tanggal).slice(0, 10) : ''].join('|').toLowerCase();
+      const { baru, ubah, hapus } = pasangkan(barisBaru, hilang, kunciRec, kunciDb);
+      await catatPerubahan({
+        site, area: 'PICA', sumber: importedBy,
+        baru: baru.map((b) => ({ pic: b.pic, nama: namaIsu(b.no, b.problem), ket: b.status })),
+        ubah: [
+          ...ubahDiTempat,
+          ...ubah.map(({ lama: l, baru: b }) => ({
+            pic: b.pic || l.pic, nama: namaIsu(b.no, b.problem), ket: b.status,
+            perubahan: bandingkan(l, b, [...KOLOM_HASH_PICA, ...KOLOM_PICA]),
+          })).filter((u) => u.perubahan.length),
+        ],
+        hapus: hapus.map((l) => ({ pic: l.pic, nama: namaIsu(l.no, l.problem), ket: l.status })),
+      });
     }
     return { inserted, updated, removed, total: records.length };
   },

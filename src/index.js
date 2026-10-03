@@ -9,6 +9,7 @@ import { signToken, requireAuth, requireSuperAdmin } from './auth.js';
 import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weeklyReport.js';
 import { PICA_SCHEMA, picaRouter, startPicaAutoSync } from './pica.js';
 import { WORK_TARGET_SCHEMA, workTargetRouter, startWorkTargetAutoSync } from './workTarget.js';
+import { CHANGE_LOG_SCHEMA, changeLogRouter } from './changeLog.js';
 
 const PORT = process.env.PORT || 4000;
 const DEFAULT_SITE_KEYS = ['bekasi', 'indramayu', 'blora', 'setu'];
@@ -402,6 +403,7 @@ app.get('/api/reports/summary', requireAuth, asyncRoute(async (_req, res) => {
 app.use('/api', weeklyReportRouter());
 app.use('/api', picaRouter());
 app.use('/api', workTargetRouter());
+app.use('/api', changeLogRouter());       // ← notifikasi perubahan Laporan Mingguan
 
 app.use((req, res) => res.status(404).json({ error: `No route: ${req.method} ${req.path}` }));
 
@@ -416,6 +418,7 @@ async function start() {
   await pool.query(WEEKLY_REPORT_SCHEMA);   // ← tabel laporan mingguan
   await pool.query(PICA_SCHEMA);            // ← tabel PICA tracker
   await pool.query(WORK_TARGET_SCHEMA);     // ← tabel Work Target tracker
+  await pool.query(CHANGE_LOG_SCHEMA);      // ← tabel log perubahan (notifikasi)
   startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
   startPicaAutoSync();                       // ← idem, untuk PICA
   startWorkTargetAutoSync();                 // ← idem, untuk Work Target

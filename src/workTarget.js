@@ -19,6 +19,7 @@ import express from 'express';
 import { query } from './db.js';
 import { requireAuth } from './auth.js';
 import { parseCsv } from './weeklyReport.js';
+import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────
 export const WORK_TARGET_SCHEMA = `
@@ -262,10 +263,37 @@ async function fetchCsvByGid(sheetId, gid) {
 }
 
 // ── Repo ──────────────────────────────────────────────────────────────────
+// Kolom di luar row_hash (noObjective|strategi|pic): edit di sheet = update di tempat.
+const KOLOM_WT = [
+  { lama: 'target_raw', baru: 'targetRaw', label: 'Target' },
+  { lama: 'keterangan', baru: 'keterangan', label: 'Keterangan' },
+  { lama: 'objective', baru: 'objective', label: 'Objective' },
+  { lama: 'activity', baru: 'activity', label: 'Activity' },
+];
+const KOLOM_HASH_WT = [{ lama: 'pic', baru: 'pic', label: 'PIC' }];
+
+/** Capaian per bulan yang berubah, mis. { kolom: 'Capaian Jul', dari: '74%', ke: '80%' }. */
+function perubahanCapaian(lamaObj, baruObj) {
+  const a = lamaObj || {}, b = baruObj || {};
+  const hasil = [];
+  for (const bulan of new Set([...Object.keys(b), ...Object.keys(a)])) {
+    const x = String(a[bulan] ?? '').trim(), y = String(b[bulan] ?? '').trim();
+    if (x !== y) hasil.push({ kolom: `Capaian ${bulan}`, dari: x || '(kosong)', ke: y || '(kosong)' });
+  }
+  return hasil;
+}
+const rincianWt = (l, b, kolom) => [...perubahanCapaian(l.pencapaian, b.pencapaian), ...bandingkan(l, b, kolom)];
+
 export const WorkTargetItems = {
   async upsertMany(records, importedBy) {
     let inserted = 0, updated = 0;
     const hashesInBatch = [];
+    // Isi lama (sebelum ditimpa) — dasar mendeteksi perubahan nyata untuk notifikasi.
+    const { rows: lamaRows } = await query(
+      `SELECT row_hash, no_objective, objective, activity, strategi, pic, target_raw, pencapaian, keterangan
+         FROM work_target_items`);
+    const lama = new Map(lamaRows.map((x) => [x.row_hash, x]));
+    const barisBaru = [], ubahDiTempat = [];
     for (const r of records) {
       const hash = hashRow(r);
       hashesInBatch.push(hash);
@@ -287,11 +315,37 @@ export const WorkTargetItems = {
          r.keterangan, r.urutan, importedBy]
       );
       rows[0].is_new ? inserted++ : updated++;
+      const ada = lama.get(hash);
+      if (!ada) barisBaru.push(r);
+      else {
+        const perubahan = rincianWt(ada, r, KOLOM_WT);
+        if (perubahan.length) ubahDiTempat.push({ pic: r.pic || ada.pic, nama: r.strategi, perubahan });
+      }
     }
     let removed = 0;
     if (hashesInBatch.length > 0) {
       const res = await query(`DELETE FROM work_target_items WHERE NOT (row_hash = ANY($1::text[]))`, [hashesInBatch]);
       removed = res.rowCount;
+    }
+    // Log perubahan untuk notifikasi (sinkron pertama = baseline, tidak dicatat).
+    // Sheet Work Target satu untuk seluruh perusahaan → site 'global'.
+    if (lama.size > 0) {
+      const batch = new Set(hashesInBatch);
+      const hilang = hashesInBatch.length > 0 ? [...lama].filter(([h]) => !batch.has(h)).map(([, v]) => v) : [];
+      const rapat = (...p) => p.join('|').toLowerCase().replace(/\s+/g, ' ');
+      const { baru, ubah, hapus } = pasangkan(
+        barisBaru, hilang, (b) => rapat(b.noObjective, b.strategi), (l) => rapat(l.no_objective, l.strategi));
+      await catatPerubahan({
+        site: 'global', area: 'WORK_TARGET', sumber: importedBy,
+        baru: baru.map((b) => ({ pic: b.pic, nama: b.strategi })),
+        ubah: [
+          ...ubahDiTempat,
+          ...ubah.map(({ lama: l, baru: b }) => ({
+            pic: b.pic || l.pic, nama: b.strategi, perubahan: rincianWt(l, b, [...KOLOM_HASH_WT, ...KOLOM_WT]),
+          })).filter((u) => u.perubahan.length),
+        ],
+        hapus: hapus.map((l) => ({ pic: l.pic, nama: l.strategi })),
+      });
     }
     return { inserted, updated, removed, total: records.length };
   },

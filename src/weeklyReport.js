@@ -9,6 +9,7 @@
 import express from 'express';
 import { query } from './db.js';
 import { requireAuth } from './auth.js';
+import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────
 export const WEEKLY_REPORT_SCHEMA = `
@@ -577,12 +578,46 @@ function assertDirectionMatches(tab, rows) {
 }
 
 // ── Repo ──────────────────────────────────────────────────────────────────
+// Kolom yang TIDAK ikut membentuk row_hash (lihat hashRow): edit di sheet = update
+// di tempat, jadi bisa dibandingkan langsung untuk log perubahan (notifikasi).
+const KOLOM_UPDATE = [
+  { lama: 'pic', baru: 'pic', label: 'PIC' },
+  { lama: 'satuan', baru: 'satuan', label: 'Satuan' },
+  { lama: 'detail_alokasi', baru: 'detailAlokasi', label: 'Detail alokasi' },
+  { lama: 'harga', baru: 'harga', label: 'Harga', tipe: 'angka' },
+  { lama: 'status_smr', baru: 'statusSmr', label: 'Status/Kondisi' },
+  { lama: 'no_shipment', baru: 'noShipment', label: 'No. Shipment' },
+  { lama: 'keterangan', baru: 'keterangan', label: 'Keterangan' },
+  { lama: 'jenis', baru: 'jenis', label: 'Jenis' },
+  { lama: 'merk', baru: 'merk', label: 'Merk' },
+  { lama: 'tipe', baru: 'tipe', label: 'Tipe' },
+];
+// Kolom pembentuk row_hash: kalau berubah, baris tampak sebagai hapus + baru.
+// Dibandingkan hanya setelah keduanya dipasangkan (lihat pasangkan()).
+const KOLOM_HASH = [
+  { lama: 'tanggal', baru: 'tanggal', label: 'Tanggal', tipe: 'tanggal' },
+  { lama: 'jumlah', baru: 'jumlah', label: 'Jumlah', tipe: 'angka' },
+  { lama: 'alokasi', baru: 'alokasi', label: 'Alokasi' },
+  { lama: 'no_mr', baru: 'noMr', label: 'No. MR' },
+  { lama: 'total_harga', baru: 'totalHarga', label: 'Total harga', tipe: 'angka' },
+];
+const ketJumlah = (jumlah, satuan) => `${Number(jumlah) || ''} ${satuan || ''}`.trim();
+
 export const WeeklyReports = {
   async upsertMany(site, tab, records, importedBy) {
     const direction = directionOf(tab);
     let inserted = 0, updated = 0;
     const hashesInBatch = [];
     const hashes = dedupeHashes(records);
+    // Isi lama (sebelum ditimpa) — dasar untuk mendeteksi perubahan nyata,
+    // karena `updated` di bawah menghitung SEMUA baris yang sudah ada.
+    const { rows: lamaRows } = await query(
+      `SELECT row_hash, tanggal, kode, nama_barang, jumlah, satuan, alokasi, detail_alokasi, pic, harga,
+              total_harga, no_mr, status_smr, no_shipment, keterangan, jenis, merk, tipe
+         FROM weekly_report_rows WHERE site = $1 AND direction = $2 AND source_tab = $3`,
+      [site, direction, tab]);
+    const lama = new Map(lamaRows.map((x) => [x.row_hash, x]));
+    const barisBaru = [], ubahDiTempat = [];
     for (let i = 0; i < records.length; i++) {
       const r = records[i];
       const hash = hashes[i];
@@ -618,6 +653,12 @@ export const WeeklyReports = {
          r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section, importedBy]
       );
       rows[0].is_new ? inserted++ : updated++;
+      const ada = lama.get(hash);
+      if (!ada) barisBaru.push(r);
+      else {
+        const perubahan = bandingkan(ada, r, KOLOM_UPDATE);
+        if (perubahan.length) ubahDiTempat.push({ pic: r.pic || ada.pic, nama: r.namaBarang, ket: ketJumlah(r.jumlah, r.satuan), perubahan });
+      }
     }
     // Baris yang tabnya sama (site+direction+source_tab) tapi hash-nya tidak
     // ada di batch saat ini berarti sudah tidak relevan lagi → dihapus.
@@ -632,6 +673,27 @@ export const WeeklyReports = {
         [site, direction, tab, hashesInBatch]
       );
       removed = res.rowCount;
+    }
+    // Log perubahan untuk notifikasi. Sinkron pertama (tab masih kosong) hanya
+    // baseline — tidak dicatat, supaya ratusan baris awal tidak membanjiri notifikasi.
+    if (lama.size > 0) {
+      const batch = new Set(hashesInBatch);
+      const hilang = hashesInBatch.length > 0 ? [...lama].filter(([h]) => !batch.has(h)).map(([, v]) => v) : [];
+      const kunciRec = (b) => [b.tanggal || '', normKode(b.kode), normNama(b.namaBarang)].join('|');
+      const kunciDb = (l) => [l.tanggal ? String(l.tanggal).slice(0, 10) : '', normKode(l.kode), normNama(l.nama_barang)].join('|');
+      const { baru, ubah, hapus } = pasangkan(barisBaru, hilang, kunciRec, kunciDb);
+      await catatPerubahan({
+        site, area: direction, sumber: importedBy,
+        baru: baru.map((b) => ({ pic: b.pic, nama: b.namaBarang, ket: ketJumlah(b.jumlah, b.satuan) })),
+        ubah: [
+          ...ubahDiTempat,
+          ...ubah.map(({ lama: l, baru: b }) => ({
+            pic: b.pic || l.pic, nama: b.namaBarang, ket: ketJumlah(b.jumlah, b.satuan),
+            perubahan: bandingkan(l, b, [...KOLOM_HASH, ...KOLOM_UPDATE]),
+          })).filter((u) => u.perubahan.length),
+        ],
+        hapus: hapus.map((l) => ({ pic: l.pic, nama: l.nama_barang, ket: ketJumlah(l.jumlah, l.satuan) })),
+      });
     }
     return { inserted, updated, removed, total: records.length };
   },
