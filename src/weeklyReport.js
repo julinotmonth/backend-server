@@ -115,8 +115,14 @@ ON CONFLICT (key) DO NOTHING;
 -- LNG Sangkulirang — beda lini produk dari CNG (Wunut/Setu/Blora/KHT),
 -- label pakai prefix "LNG" sendiri (lihat labelPenuh() di
 -- WeeklyReportView.tsx yang sudah dibuat mengenali prefix ini juga).
+-- Hanya ditanam kalau BELUM ada site berlabel sama (huruf besar/kecil tak
+-- dibedakan). Tanpa pengecekan ini, kalau site LNG sudah dibuat lewat menu
+-- Site Operasional dengan key lain (mis. "LNG SANGKULIRANG"), baris seed ini
+-- ikut muncul sebagai duplikat di dropdown — dan tertanam lagi tiap server
+-- start walau sudah dihapus. (Lihat juga siteCleanup.js.)
 INSERT INTO sites (key, label, subtitle, color, image_url, is_default)
-VALUES ('sangkulirang', 'LNG Sangkulirang', 'Fasilitas LNG Sangkulirang', '#A78BFA', '/assets/images/cng-cylinder.webp', FALSE)
+SELECT 'sangkulirang', 'LNG Sangkulirang', 'Fasilitas LNG Sangkulirang', '#A78BFA', '/assets/images/cng-cylinder.webp', FALSE
+WHERE NOT EXISTS (SELECT 1 FROM sites WHERE lower(trim(label)) = 'lng sangkulirang')
 ON CONFLICT (key) DO NOTHING;
 `;
 

@@ -10,6 +10,7 @@ import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weekl
 import { PICA_SCHEMA, picaRouter, startPicaAutoSync } from './pica.js';
 import { WORK_TARGET_SCHEMA, workTargetRouter, startWorkTargetAutoSync } from './workTarget.js';
 import { CHANGE_LOG_SCHEMA, changeLogRouter } from './changeLog.js';
+import { rapikanSiteKembar } from './siteCleanup.js';
 
 const PORT = process.env.PORT || 4000;
 const DEFAULT_SITE_KEYS = ['bekasi', 'indramayu', 'blora', 'setu'];
@@ -419,6 +420,7 @@ async function start() {
   await pool.query(PICA_SCHEMA);            // ← tabel PICA tracker
   await pool.query(WORK_TARGET_SCHEMA);     // ← tabel Work Target tracker
   await pool.query(CHANGE_LOG_SCHEMA);      // ← tabel log perubahan (notifikasi)
+  await rapikanSiteKembar();                // ← buang site kembar yang kosong (mis. "LNG Sangkulirang" ganda)
   startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
   startPicaAutoSync();                       // ← idem, untuk PICA
   startWorkTargetAutoSync();                 // ← idem, untuk Work Target
