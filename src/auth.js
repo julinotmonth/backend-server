@@ -1,10 +1,17 @@
 import jwt from 'jsonwebtoken';
 
 // JWT_SECRET wajib diisi di production. Fallback hanya untuk development lokal.
-if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
-  throw new Error('JWT_SECRET wajib diisi (minimal 32 karakter) saat NODE_ENV=production.');
+const DEV_SECRET = 'reethau-dev-secret-change-me';
+if (process.env.NODE_ENV === 'production') {
+  const secret = process.env.JWT_SECRET || '';
+  if (!secret || secret === DEV_SECRET || secret.length < 32) {
+    throw new Error(
+      `JWT_SECRET tidak valid untuk production (panjang sekarang: ${secret.length}, minimal 32, dan tidak boleh memakai nilai bawaan dev). ` +
+      `Buat dengan: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`
+    );
+  }
 }
-const JWT_SECRET = process.env.JWT_SECRET || 'reethau-dev-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || DEV_SECRET;
 const TOKEN_TTL = '7d';
 
 export function signToken(user) {
