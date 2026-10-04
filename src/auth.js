@@ -1,8 +1,9 @@
 import jwt from 'jsonwebtoken';
 
-// In a real deployment this must come from an environment variable. It's
-// inlined here only so the demo runs with zero setup — rotate it (and
-// invalidate existing sessions) before using this anywhere but locally.
+// JWT_SECRET wajib diisi di production. Fallback hanya untuk development lokal.
+if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
+  throw new Error('JWT_SECRET wajib diisi (minimal 32 karakter) saat NODE_ENV=production.');
+}
 const JWT_SECRET = process.env.JWT_SECRET || 'reethau-dev-secret-change-me';
 const TOKEN_TTL = '7d';
 

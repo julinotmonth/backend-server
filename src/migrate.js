@@ -1,11 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { pool, query } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_PASSWORD = 'reethau123';
+// Password bawaan versi lama. Dipertahankan HANYA agar akun lama yang masih
+// memakainya bisa dideteksi dan dinonaktifkan — tidak pernah dipakai untuk akun baru.
+const LEGACY_DEFAULT_PASSWORD = 'reethau123';
+const MIN_ADMIN_PASSWORD_LENGTH = 12;
 
 async function runSchema() {
   const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
@@ -68,24 +72,86 @@ async function seedCategories() {
   }
 }
 
-async function seedUsers() {
-  const { rows } = await query('SELECT COUNT(*)::int AS count FROM users');
-  if (rows[0].count > 0) return;
+// Akun Super Admin dikelola lewat environment variable, bukan hard-code di
+// kode/frontend:
+//   ADMIN_EMAIL     email login Super Admin
+//   ADMIN_PASSWORD  kata sandi (minimal 12 karakter)
+//   ADMIN_NAME      (opsional) nama tampilan, default "Admin"
+// Setiap boot, akun 'user-admin' disamakan dengan nilai env — jadi untuk
+// mengganti kredensial cukup ubah env lalu restart.
+async function ensureAdminAccount() {
+  const email = (process.env.ADMIN_EMAIL || '').trim();
+  const password = process.env.ADMIN_PASSWORD || '';
+  const name = (process.env.ADMIN_NAME || 'Admin').trim();
+  const { rows: countRows } = await query('SELECT COUNT(*)::int AS count FROM users');
+  const noUsersYet = countRows[0].count === 0;
 
-  const passwordHash = bcrypt.hashSync(DEFAULT_PASSWORD, 10);
-  const users = [
-    ['user-admin', 'Admin', 'admin@reethau.com', 'Super Admin', 'Super Admin', 'global', '2026-01-05'],
-    ['user-hendra', 'Hendra Gunawan', 'hendra.gunawan@reethau.com', 'Site Manager Bekasi', 'Site Manager', 'bekasi', '2026-02-10'],
-    ['user-budi', 'Budi Santoso', 'budi.santoso@reethau.com', 'Admin Inventaris', 'Maintenance Engineer', 'blora', '2026-03-18'],
-  ];
-  for (const [id, name, email, position, role, assignedSite, createdAt] of users) {
+  if (!email || !password) {
+    if (!noUsersYet) return; // sudah ada akun; env tidak diatur = tidak ada perubahan
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('ADMIN_EMAIL dan ADMIN_PASSWORD wajib diisi saat pertama kali deploy (NODE_ENV=production).');
+    }
+    // Development: buat admin dengan password acak, tampilkan sekali di log.
+    const devEmail = 'admin@reethau.local';
+    const devPassword = crypto.randomBytes(12).toString('base64url');
     await query(
-      `INSERT INTO users (id, name, email, password_hash, position, role, assigned_site, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [id, name, email, passwordHash, position, role, assignedSite, createdAt]
+      `INSERT INTO users (id, name, email, password_hash, position, role, assigned_site)
+       VALUES ('user-admin', $1, $2, $3, 'Super Admin', 'Super Admin', 'global')`,
+      [name, devEmail, bcrypt.hashSync(devPassword, 10)]
     );
+    console.log(`[migrate] ADMIN_EMAIL/ADMIN_PASSWORD tidak diatur. Akun dev dibuat — email: ${devEmail}  password: ${devPassword}  (tampil sekali, simpan sekarang)`);
+    return;
   }
-  console.log(`[migrate] Seeded default users. Password for all seed accounts: "${DEFAULT_PASSWORD}"`);
+
+  if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    throw new Error(`ADMIN_PASSWORD minimal ${MIN_ADMIN_PASSWORD_LENGTH} karakter.`);
+  }
+
+  const { rows } = await query("SELECT * FROM users WHERE id = 'user-admin'");
+  if (rows.length === 0) {
+    const { rows: taken } = await query('SELECT 1 FROM users WHERE lower(email) = lower($1)', [email]);
+    if (taken.length > 0) {
+      throw new Error('ADMIN_EMAIL sudah dipakai akun lain; pilih email yang berbeda.');
+    }
+    await query(
+      `INSERT INTO users (id, name, email, password_hash, position, role, assigned_site)
+       VALUES ('user-admin', $1, $2, $3, 'Super Admin', 'Super Admin', 'global')`,
+      [name, email, bcrypt.hashSync(password, 10)]
+    );
+    console.log(`[migrate] Akun Super Admin dibuat (${email}).`);
+    return;
+  }
+
+  const current = rows[0];
+  const emailChanged = current.email.toLowerCase() !== email.toLowerCase();
+  const passwordChanged = !bcrypt.compareSync(password, current.password_hash);
+  if (!emailChanged && !passwordChanged) return;
+  if (emailChanged) {
+    const { rows: taken } = await query('SELECT 1 FROM users WHERE lower(email) = lower($1) AND id <> $2', [email, current.id]);
+    if (taken.length > 0) throw new Error('ADMIN_EMAIL sudah dipakai akun lain; pilih email yang berbeda.');
+  }
+  await query('UPDATE users SET email = $1, password_hash = $2 WHERE id = $3', [
+    email,
+    passwordChanged ? bcrypt.hashSync(password, 10) : current.password_hash,
+    current.id,
+  ]);
+  console.log(`[migrate] Kredensial Super Admin diperbarui dari environment (${[emailChanged && 'email', passwordChanged && 'password'].filter(Boolean).join(' + ')}).`);
+}
+
+// Database lama punya akun demo (hendra/budi, dll.) dengan password publik
+// "reethau123". Akun semacam itu dinonaktifkan: password diganti nilai acak
+// yang tidak diketahui siapa pun. Super Admin bisa menghapusnya dan membuat
+// ulang lewat menu Manajemen User (password sementara acak akan ditampilkan).
+async function retireLegacyDefaultPasswords() {
+  const { rows } = await query('SELECT id, email, password_hash FROM users');
+  for (const u of rows) {
+    if (!bcrypt.compareSync(LEGACY_DEFAULT_PASSWORD, u.password_hash)) continue;
+    await query('UPDATE users SET password_hash = $1 WHERE id = $2', [
+      bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10),
+      u.id,
+    ]);
+    console.warn(`[migrate] Akun ${u.email} masih memakai password bawaan lama -> DINONAKTIFKAN. Hapus & buat ulang dari menu Manajemen User.`);
+  }
 }
 
 async function seedSpareParts() {
@@ -215,7 +281,8 @@ export async function migrate() {
   await fixActivityLogConstraint();
   await seedSites();
   await seedCategories();
-  await seedUsers();
+  await ensureAdminAccount();
+  await retireLegacyDefaultPasswords();
   await seedSpareParts();
   await seedLogs();
   await seedGallery();

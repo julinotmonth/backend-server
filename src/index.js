@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import 'dotenv/config';
 import { pool } from './db.js';
@@ -16,7 +17,9 @@ const PORT = process.env.PORT || 4000;
 const DEFAULT_SITE_KEYS = ['bekasi', 'indramayu', 'blora', 'setu'];
 
 const app = express();
-app.use(cors());
+if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || true); // di belakang nginx/Cloudflare/dll.
+// Di production sebaiknya batasi origin: CORS_ORIGIN=https://domain-anda.com (pisahkan koma bila lebih dari satu).
+app.use(cors(process.env.CORS_ORIGIN ? { origin: process.env.CORS_ORIGIN.split(',').map((o) => o.trim()) } : undefined));
 app.use(express.json({ limit: '12mb' })); // generous limit — uploaded photos are sent as base64 data URLs
 
 const nowTimestamp = () => {
@@ -37,15 +40,44 @@ app.get('/api/health', asyncRoute(async (_req, res) => {
 }));
 
 // ── Auth ─────────────────────────────────────────────────────────────────
+// Pembatas percobaan login (in-memory): maks 8 gagal per 15 menit untuk
+// kombinasi IP + email. Cukup untuk satu instance; pakai store bersama
+// (mis. Redis) bila server dijalankan lebih dari satu replika.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILS = 8;
+const loginFails = new Map(); // key -> { count, resetAt }
+const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of loginFails) if (v.resetAt <= now) loginFails.delete(k);
+}, 5 * 60 * 1000).unref();
+
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) {
+  if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
     return res.status(400).json({ error: 'Email dan password wajib diisi.' });
   }
-  const row = await Users.findByEmail(email);
-  if (!row || !bcrypt.compareSync(password, row.password_hash)) {
+  const key = `${req.ip}|${email.trim().toLowerCase()}`;
+  const entry = loginFails.get(key);
+  if (entry && entry.resetAt > Date.now() && entry.count >= LOGIN_MAX_FAILS) {
+    const mins = Math.ceil((entry.resetAt - Date.now()) / 60000);
+    res.set('Retry-After', String(mins * 60));
+    return res.status(429).json({ error: `Terlalu banyak percobaan login. Coba lagi dalam ${mins} menit.` });
+  }
+
+  const row = await Users.findByEmail(email.trim());
+  // Selalu jalankan satu bcrypt compare agar waktu respons tidak membocorkan
+  // apakah email terdaftar.
+  const ok = bcrypt.compareSync(password, row ? row.password_hash : DUMMY_HASH) && !!row;
+  if (!ok) {
+    const now = Date.now();
+    const cur = entry && entry.resetAt > now ? entry : { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+    cur.count += 1;
+    loginFails.set(key, cur);
     return res.status(401).json({ error: 'Email atau password salah.' });
   }
+  loginFails.delete(key);
   const user = await Users.findById(row.id);
   const token = signToken(user);
   res.json({ token, user });
@@ -68,19 +100,19 @@ app.post('/api/users', requireAuth, requireSuperAdmin, asyncRoute(async (req, re
   if (await Users.findByEmail(email)) {
     return res.status(409).json({ error: 'Email tersebut sudah terdaftar.' });
   }
+  const temporaryPassword = crypto.randomBytes(9).toString('base64url'); // 12 karakter acak
   const user = await Users.insert({
     id: `user-${Date.now().toString(36)}`,
     name,
     email,
-    // New accounts get the same default password as the seed accounts —
-    // a real deployment should email an invite/reset link instead.
-    passwordHash: bcrypt.hashSync('reethau123', 10),
+    // Password sementara acak, ditampilkan SEKALI ke Super Admin yang membuat akun.
+    passwordHash: bcrypt.hashSync(temporaryPassword, 10),
     position: position || role || 'Anggota Tim',
     role: role || 'Site Manager',
     assignedSite: assignedSite || 'global',
   });
   if (avatarUrl) await Users.update(user.id, { avatarUrl });
-  res.status(201).json(await Users.findById(user.id));
+  res.status(201).json({ ...(await Users.findById(user.id)), temporaryPassword });
 }));
 
 app.patch('/api/users/:id', requireAuth, asyncRoute(async (req, res) => {
