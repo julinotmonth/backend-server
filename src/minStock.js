@@ -46,9 +46,10 @@ const low = (s) => norm(s).toLowerCase();
 
 /** "124 Item" → 124, "1.234 Item" → 1234, "" / "83,2%" → null. */
 function parseCount(raw) {
-  const s = norm(raw);
-  if (!s || s.includes('%')) return null;
-  if (!/\d/.test(s)) return null;
+  const s = norm(raw).replace(/item/i, '').trim();
+  if (!s || s.includes('%') || !/\d/.test(s)) return null;
+  if (/^\d{1,3}(\.\d{3})+$/.test(s)) return Number(s.replace(/\./g, ''));   // 1.234 → 1234 (pemisah ribuan id-ID)
+  if (/^\d+[.,]\d+$/.test(s)) return Math.round(Number(s.replace(',', '.')));  // 143,0 / 143.0 → 143
   const n = Number(s.replace(/[^0-9]/g, ''));
   return Number.isFinite(n) ? n : null;
 }
@@ -95,7 +96,8 @@ export function parseMinStockCsv(csvText) {
 
   // 2) Baris sub-judul (Jumlah Min Stock / Terealisasi / …) — bisa sama dengan baris minggu (bentuk gviz)
   let metricRow = weekRow;
-  const kolomMetrik = (r) => rows[r].filter((c) => metricOf(c)).length;
+  // Sub-judul berupa label murni; sel data ('93%', '143 Item') berisi angka dan tidak dihitung.
+  const kolomMetrik = (r) => rows[r].filter((c) => metricOf(c) && !/\d/.test(c)).length;
   if (kolomMetrik(weekRow) < 4) {
     for (let i = weekRow + 1; i <= Math.min(weekRow + 3, rows.length - 1); i++) {
       if (kolomMetrik(i) >= 4) { metricRow = i; break; }
@@ -112,14 +114,26 @@ export function parseMinStockCsv(csvText) {
     const cell = norm(rows[weekRow][c]);
     const m = WEEK_RE.exec(cell);
     if (m) cur = Number(m[1]);
-    else if (cell) cur = null; // label lain (mis. "Kategori") memutus carry-forward
+    // Header bertingkat yang digabung Google: sel "Week 38" hanya ada di kolom pertama grup,
+    // kolom lain berisi sub-judul ("Terealisasi", dst.) → itu TIDAK memutus minggu.
+    // Hanya label non-metrik (mis. "Kategori") yang memutus.
+    else if (cell && !metricOf(cell)) cur = null;
     colWeek[c] = cur;
     let met = metricOf(rows[weekRow][c]);
     if (!met && metricRow !== weekRow) met = metricOf(rows[metricRow][c]);
     colMetric[c] = met;
   }
-  // Cadangan: metrik tak terbaca → ikuti urutan posisi dalam grup 4 kolom
   const URUT = ['min', 'real', 'belum', 'pct'];
+  // Cadangan 1: kolom "Jumlah Min Stock" terbaca tapi kolom sesudahnya tidak → grup 4 kolom berurutan.
+  if (!colMetric.some((m, c) => m === 'real' && colWeek[c] !== null)) {
+    for (let c = 0; c < lebar; c++) {
+      if (colMetric[c] !== 'min' || colWeek[c] === null) continue;
+      for (let k = 1; k <= 3 && c + k < lebar; k++) {
+        if (colWeek[c + k] === null) { colWeek[c + k] = colWeek[c]; colMetric[c + k] = URUT[k]; }
+      }
+    }
+  }
+  // Cadangan 2: metrik tak terbaca → ikuti urutan posisi dalam grup 4 kolom
   const posisi = {};
   for (let c = 0; c < lebar; c++) {
     if (colWeek[c] === null) continue;
@@ -134,8 +148,8 @@ export function parseMinStockCsv(csvText) {
   for (let i = 0; i <= headerEnd; i++) {
     rows[i].forEach((c, idx) => {
       const t = low(c);
-      if (t === 'kategori' || t === 'category') catCol = idx;
-      else if (t === 'location' || t === 'lokasi') locCol = idx;
+      if (/(^|\s)(kategori|category)$/.test(t)) catCol = idx;
+      else if (/(^|\s)(location|lokasi)$/.test(t)) locCol = idx;
     });
   }
 
@@ -221,7 +235,11 @@ export function parseMinStockCsv(csvText) {
     return { n: w, label: `Week ${String(w).padStart(2, '0')}`, filled: sMin > 0 && sReal > 0 };
   });
   if (!weeks.some((w) => w.filled)) {
-    throw Object.assign(new Error('Semua minggu bernilai 0 — sheet belum berisi realisasi.'), { status: 400 });
+    const hitung = (m) => colMetric.filter((x, c) => x === m && colWeek[c] !== null).length;
+    throw Object.assign(new Error(
+      'Semua minggu bernilai 0 — sheet belum berisi realisasi, atau kolom tidak terbaca. ' +
+      `[diagnostik: ${weeks.length} minggu; kolom min=${hitung('min')}, terealisasi=${hitung('real')}, belum=${hitung('belum')}, pct=${hitung('pct')}; ` +
+      `baris minggu=${weekRow}, baris sub-judul=${metricRow}; kategori=kolom ${catCol}, lokasi=kolom ${locCol}]`), { status: 400 });
   }
 
   const targets = Object.values(sheetTotals).map((t) => t.target).filter((x) => typeof x === 'number');
