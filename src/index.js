@@ -11,6 +11,7 @@ import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weekl
 import { PICA_SCHEMA, picaRouter, startPicaAutoSync } from './pica.js';
 import { WORK_TARGET_SCHEMA, workTargetRouter, startWorkTargetAutoSync } from './workTarget.js';
 import { MIN_STOCK_SCHEMA, minStockRouter, startMinStockAutoSync } from './minStock.js';
+import { OUTSTANDING_PR_SCHEMA, outstandingPrRouter, startOutstandingPrAutoSync } from './outstandingPr.js';
 import { CHANGE_LOG_SCHEMA, changeLogRouter } from './changeLog.js';
 import { rapikanSiteKembar } from './siteCleanup.js';
 
@@ -438,6 +439,7 @@ app.use('/api', weeklyReportRouter());
 app.use('/api', picaRouter());
 app.use('/api', workTargetRouter());
 app.use('/api', minStockRouter());          // ← Pencapaian Minimum Stok
+app.use('/api', outstandingPrRouter());     // ← Outstanding PR
 app.use('/api', changeLogRouter());       // ← notifikasi perubahan Laporan Mingguan
 
 app.use((req, res) => res.status(404).json({ error: `No route: ${req.method} ${req.path}` }));
@@ -454,12 +456,14 @@ async function start() {
   await pool.query(PICA_SCHEMA);            // ← tabel PICA tracker
   await pool.query(WORK_TARGET_SCHEMA);     // ← tabel Work Target tracker
   await pool.query(MIN_STOCK_SCHEMA);       // ← tabel Pencapaian Minimum Stok
+  await pool.query(OUTSTANDING_PR_SCHEMA);  // ← tabel Outstanding PR
   await pool.query(CHANGE_LOG_SCHEMA);      // ← tabel log perubahan (notifikasi)
   await rapikanSiteKembar();                // ← buang site kembar yang kosong (mis. "LNG Sangkulirang" ganda)
   startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
   startPicaAutoSync();                       // ← idem, untuk PICA
   startWorkTargetAutoSync();                 // ← idem, untuk Work Target
   startMinStockAutoSync();                   // ← idem, untuk Pencapaian Minimum Stok
+  startOutstandingPrAutoSync();              // ← idem, untuk Outstanding PR
   app.listen(PORT, () => {
     console.log(`[server] Reethau Inventory API listening on http://localhost:${PORT}`);
   });
