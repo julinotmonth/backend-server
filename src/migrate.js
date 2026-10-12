@@ -9,7 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Password bawaan versi lama. Dipertahankan HANYA agar akun lama yang masih
 // memakainya bisa dideteksi dan dinonaktifkan — tidak pernah dipakai untuk akun baru.
 const LEGACY_DEFAULT_PASSWORD = 'reethau123';
-const MIN_ADMIN_PASSWORD_LENGTH = 12;
+const MIN_ADMIN_PASSWORD_LENGTH = 8;
 
 async function runSchema() {
   const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
@@ -75,7 +75,7 @@ async function seedCategories() {
 // Akun Super Admin dikelola lewat environment variable, bukan hard-code di
 // kode/frontend:
 //   ADMIN_EMAIL     email login Super Admin
-//   ADMIN_PASSWORD  kata sandi (minimal 12 karakter)
+//   ADMIN_PASSWORD  kata sandi (minimal 8 karakter; makin panjang & acak makin aman)
 //   ADMIN_NAME      (opsional) nama tampilan, default "Admin"
 // Setiap boot, akun 'user-admin' disamakan dengan nilai env — jadi untuk
 // mengganti kredensial cukup ubah env lalu restart.
