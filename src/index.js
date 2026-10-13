@@ -14,9 +14,10 @@ import { MIN_STOCK_SCHEMA, minStockRouter, startMinStockAutoSync } from './minSt
 import { OUTSTANDING_PR_SCHEMA, outstandingPrRouter, startOutstandingPrAutoSync } from './outstandingPr.js';
 import { CHANGE_LOG_SCHEMA, changeLogRouter } from './changeLog.js';
 import { rapikanSiteKembar } from './siteCleanup.js';
+import { sesuaikanSite } from './siteRename.js';
 
 const PORT = process.env.PORT || 4000;
-const DEFAULT_SITE_KEYS = ['bekasi', 'indramayu', 'blora', 'setu'];
+const DEFAULT_SITE_KEYS = ['indramayu', 'blora', 'setu'];
 
 const app = express();
 if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || true); // di belakang nginx/Cloudflare/dll.
@@ -458,6 +459,7 @@ async function start() {
   await pool.query(MIN_STOCK_SCHEMA);       // ← tabel Pencapaian Minimum Stok
   await pool.query(OUTSTANDING_PR_SCHEMA);  // ← tabel Outstanding PR
   await pool.query(CHANGE_LOG_SCHEMA);      // ← tabel log perubahan (notifikasi)
+  await sesuaikanSite();                    // ← WS Dawuan → WS Cibungur, hapus MS Bekasi (bila kosong)
   await rapikanSiteKembar();                // ← buang site kembar yang kosong (mis. "LNG Sangkulirang" ganda)
   startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
   startPicaAutoSync();                       // ← idem, untuk PICA
