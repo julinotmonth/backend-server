@@ -8,10 +8,10 @@
 //      Hanya diubah bila label-nya masih "Dawuan", jadi kalau kamu sudah
 //      mengganti nama lewat menu Site Operasional, tidak ditimpa.
 //   2. Site "bekasi" dihapus — MS Bekasi dan MS Setu adalah lokasi yang sama.
-//      Dihapus HANYA bila tidak punya data sama sekali (laporan mingguan,
-//      PICA, spare part, aset tetap, galeri, user yang di-assign). Kalau masih
-//      ada data, site dibiarkan dan diberi peringatan di log — tidak ada data
-//      yang dihapus berdasarkan tebakan.
+//      Data yang masih menempel di Bekasi (laporan mingguan, PICA, spare part,
+//      aset tetap, galeri, user yang di-assign) DIPINDAHKAN ke Setu, bukan
+//      dihapus. Semuanya dalam satu transaksi: bila ada yang gagal (mis.
+//      bentrok data ganda), tidak ada yang berubah dan peringatan ditulis di log.
 //
 // Matikan dengan env SITE_RENAME=off.
 
@@ -50,15 +50,21 @@ export async function sesuaikanSite({ log = console } = {}) {
       if (r.rows[0].n > 0) (tabelKonfigurasi(tabel) ? konfigurasi : data).push({ tabel, kolom: col, n: r.rows[0].n });
     }
     if (data.length) {
-      const rinci = data.map((d) => `${d.tabel}=${d.n}`).join(', ');
-      log.warn(`[site-rename] site "bekasi" masih punya data (${rinci}) — TIDAK dihapus. Pindahkan/hapus datanya dulu, lalu restart server.`);
-      return;
+      // Masih ada data (mis. data contoh dari seed). MS Bekasi = MS Setu (lokasi
+      // yang sama), jadi datanya DIPINDAHKAN ke Setu — tidak ada yang dihapus.
+      const { rows: setu } = await query(`SELECT key FROM sites WHERE key = 'setu'`);
+      if (!setu.length) {
+        log.warn('[site-rename] site "bekasi" masih punya data dan site "setu" tidak ada — TIDAK dihapus.');
+        return;
+      }
     }
     await withTransaction(async (c) => {
-      for (const { tabel, kolom: col } of konfigurasi) await c.query(`DELETE FROM "${tabel}" WHERE "${col}" = $1`, ['bekasi']);
+      for (const d of data) await c.query(`UPDATE "${d.tabel}" SET "${d.kolom}" = 'setu' WHERE "${d.kolom}" = 'bekasi'`);
+      for (const k of konfigurasi) await c.query(`DELETE FROM "${k.tabel}" WHERE "${k.kolom}" = 'bekasi'`);
       await c.query(`DELETE FROM sites WHERE key = 'bekasi'`);
     });
-    log.info('[site-rename] site "bekasi" dihapus.');
+    const rinci = data.map((d) => `${d.tabel}=${d.n}`).join(', ');
+    log.info(`[site-rename] site "bekasi" dihapus${data.length ? `; data dipindahkan ke "setu" (${rinci})` : ''}.`);
   } catch (err) {
     log.warn('[site-rename] gagal, dilewati:', err.message);
   }
