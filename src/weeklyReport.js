@@ -583,6 +583,98 @@ function assertDirectionMatches(tab, rows) {
   }
 }
 
+// ── Satu spreadsheet untuk banyak site ────────────────────────────────────
+// Dipakai fitur "Hubungkan satu spreadsheet ke semua site": admin menempel SATU URL,
+// server membaca daftar tab-nya, mencocokkan tiap tab ke site, lalu menyimpan sumber
+// semua site sekaligus. gviz CSV tidak bisa mendaftar tab, jadi daftar tab dibaca dari
+// halaman htmlview (butuh sheet dibagikan "Anyone with the link"). Kalau gagal, admin
+// bisa menempel nama tab secara manual — pemetaan ke site tetap berjalan sama.
+
+const decodeEntitas = (t) => String(t)
+  .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+  .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+  .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+// Nama tab di halaman htmlview ditulis sebagai string JavaScript ("\x26", "\u0026", "\/" …).
+const decodeLiteralJs = (lit) => {
+  try { return JSON.parse(lit.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => `\\u00${h}`)); }
+  catch { return lit.slice(1, -1); }
+};
+
+/** Ambil [{name, gid}] dari HTML halaman htmlview sebuah spreadsheet. */
+export function parseSheetTabs(html) {
+  const hasil = [];
+  const sudah = new Set();
+  const tambah = (name, gid) => {
+    const nama = String(name || '').trim();
+    if (!nama || sudah.has(nama)) return;
+    sudah.add(nama);
+    hasil.push({ name: nama, gid: gid ? String(gid) : null });
+  };
+  // Pola utama: items.push({name: "Tab", pageUrl: "...", gid: "123", ...})
+  const reItems = /items\.push\(\{\s*name:\s*("(?:[^"\\]|\\.)*")[^}]*?gid:\s*"(\d+)"/g;
+  for (let m; (m = reItems.exec(html));) tambah(decodeLiteralJs(m[1]), m[2]);
+  // Cadangan: menu tab HTML — <li id="sheet-button-123"><a ...>Tab</a></li>
+  if (!hasil.length) {
+    const reMenu = /<li[^>]*id="sheet-button-(\d+)"[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/g;
+    for (let m; (m = reMenu.exec(html));) tambah(decodeEntitas(m[2].replace(/<[^>]+>/g, '')), m[1]);
+  }
+  return hasil;
+}
+
+export async function fetchSheetTabs(sheetId) {
+  const res = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/htmlview`, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`Google menolak akses daftar tab (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`);
+  const tabs = parseSheetTabs(await res.text());
+  if (!tabs.length) throw new Error('Daftar tab tidak terbaca dari halaman Google. Tempel nama tab secara manual.');
+  return tabs;
+}
+
+const normTab = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const KATA_ABAIKAN = new Set(['ms', 'ws', 'lng', 'mother', 'station']);
+/** Kata kunci pengenal sebuah site: key-nya + kata pada labelnya (tanpa awalan MS/WS/LNG). */
+const tokenSite = (site) => {
+  const t = new Set([normTab(site.key)]);
+  for (const w of normTab(site.label).split(' ')) if (w.length >= 3 && !KATA_ABAIKAN.has(w)) t.add(w);
+  return [...t].filter(Boolean);
+};
+const TAB_RELEVAN = /report\s*weekly|weekly\s*report|barang\s*(masuk|keluar)|list\s*all\s*aset|\baset\b|\b(in|out)\b(\s*\(\d+\))?$/i;
+
+/**
+ * Cocokkan setiap tab ke satu site.
+ *  1) nama tab memuat kata pengenal site ("Report Weekly MS Wunut RDA IN" → wunut)
+ *  2) kalau tidak, dan nama tab persis sama dengan tab yang sudah terpasang pada TEPAT SATU site
+ * Hasil `site: null` = tidak bisa ditentukan → admin memilih manual di layar tinjau.
+ */
+export function petakanTabKeSite(tabs, sites, sumberSaatIni = []) {
+  const terpasang = new Map(); // nama tab (normal) -> Set(site)
+  for (const src of sumberSaatIni) for (const t of src.tabs || []) {
+    const k = normTab(t);
+    if (!terpasang.has(k)) terpasang.set(k, new Set());
+    terpasang.get(k).add(src.site);
+  }
+  return tabs.map((tab) => {
+    const n = ` ${normTab(tab.name)} `;
+    let terbaik = 0, kandidat = [], kata = '';
+    for (const site of sites) {
+      for (const tok of tokenSite(site)) {
+        if (!n.includes(` ${tok} `)) continue;
+        if (tok.length > terbaik) { terbaik = tok.length; kandidat = [site.key]; kata = tok; }
+        else if (tok.length === terbaik && !kandidat.includes(site.key)) kandidat.push(site.key);
+      }
+    }
+    let site = null, alasan = '';
+    if (kandidat.length === 1) { site = kandidat[0]; alasan = `nama tab memuat "${kata}"`; }
+    else if (kandidat.length > 1) alasan = 'nama tab cocok dengan lebih dari satu site';
+    else {
+      const ada = terpasang.get(normTab(tab.name));
+      if (ada && ada.size === 1) { site = [...ada][0]; alasan = 'sama dengan tab yang sudah terpasang di site ini'; }
+      else if (ada && ada.size > 1) alasan = 'nama tab dipakai beberapa site';
+    }
+    return { name: tab.name, gid: tab.gid ?? null, arah: directionOf(tab.name), relevan: TAB_RELEVAN.test(tab.name.trim()), site, alasan };
+  });
+}
+
 // ── Repo ──────────────────────────────────────────────────────────────────
 // Kolom yang TIDAK ikut membentuk row_hash (lihat hashRow): edit di sheet = update
 // di tempat, jadi bisa dibandingkan langsung untuk log perubahan (notifikasi).
@@ -822,6 +914,62 @@ export function weeklyReportRouter() {
     if (!site || !sheetId) return res.status(400).json({ error: 'Site dan URL Google Spreadsheet wajib diisi.' });
     if (!Array.isArray(tabs) || !tabs.length) return res.status(400).json({ error: 'Minimal satu nama tab wajib diisi.' });
     res.json(await WeeklyReports.saveSource(site, sheetId, tabs, autoSync));
+  }));
+
+  // ── Hubungkan SATU spreadsheet ke banyak site (khusus akun global) ───────
+  const wajibGlobal = (req) => {
+    if (req.auth.role === 'Super Admin' || req.auth.assignedSite === 'global' || !req.auth.assignedSite) return;
+    throw Object.assign(new Error('Hanya akun Super Admin / global yang boleh menghubungkan satu spreadsheet ke banyak site.'), { status: 403 });
+  };
+
+  // Langkah 1: baca daftar tab lalu usulkan pemetaan tab → site (belum menyimpan apa pun).
+  r.post('/weekly-reports/source/discover', requireAuth, wrap(async (req, res) => {
+    wajibGlobal(req);
+    const { sheetUrl, tabs: manual } = req.body || {};
+    const sheetId = extractSheetId(sheetUrl);
+    if (!sheetId) return res.status(400).json({ error: 'URL Google Spreadsheet tidak valid.' });
+
+    let daftar, sumber = 'otomatis';
+    if (Array.isArray(manual) && manual.some((t) => String(t).trim())) {
+      daftar = manual.map((t) => ({ name: String(t).trim(), gid: null })).filter((t) => t.name);
+      sumber = 'manual';
+    } else {
+      try { daftar = await fetchSheetTabs(sheetId); }
+      catch (err) { return res.status(422).json({ error: err.message, bisaManual: true }); }
+    }
+    const [{ rows: sites }, { rows: srcRows }] = await Promise.all([
+      query('SELECT key, label FROM sites ORDER BY created_at ASC'),
+      query('SELECT site, tabs FROM weekly_report_sources'),
+    ]);
+    const sumberSaatIni = srcRows.map((x) => ({ site: x.site, tabs: x.tabs ? x.tabs.split('|') : [] }));
+    res.json({ sheetId, sumber, sites, tabs: petakanTabKeSite(daftar, sites, sumberSaatIni) });
+  }));
+
+  // Langkah 2: simpan sumber untuk semua site sekaligus (sync dijalankan klien per site).
+  r.post('/weekly-reports/source/bulk', requireAuth, wrap(async (req, res) => {
+    wajibGlobal(req);
+    const { sheetUrl, assignments, autoSync } = req.body || {};
+    const sheetId = extractSheetId(sheetUrl);
+    if (!sheetId) return res.status(400).json({ error: 'URL Google Spreadsheet tidak valid.' });
+    if (!Array.isArray(assignments) || !assignments.length) return res.status(400).json({ error: 'Tidak ada site yang dipilih.' });
+
+    const { rows: sites } = await query('SELECT key FROM sites');
+    const dikenal = new Set(sites.map((x) => x.key));
+    const bersih = [];
+    for (const a of assignments) {
+      const tabs = [...new Set((a?.tabs || []).map((t) => String(t).trim()).filter(Boolean))];
+      if (!a?.site || !dikenal.has(a.site)) return res.status(400).json({ error: `Site "${a?.site}" tidak dikenal.` });
+      if (!tabs.length) continue;
+      bersih.push({ site: a.site, tabs });
+    }
+    if (!bersih.length) return res.status(400).json({ error: 'Tiap site minimal butuh satu tab.' });
+
+    const tersimpan = [];
+    for (const a of bersih) {
+      await WeeklyReports.saveSource(a.site, sheetId, a.tabs, autoSync);
+      tersimpan.push({ site: a.site, tabs: a.tabs });
+    }
+    res.json({ sheetId, tersimpan });
   }));
 
   // Tarik ulang dari Google Sheet. Dipanggil manual maupun oleh auto-sync.
