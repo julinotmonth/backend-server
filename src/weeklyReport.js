@@ -524,8 +524,11 @@ export function extractSheetId(input) {
   return m ? m[1] : (/^[a-zA-Z0-9-_]{20,}$/.test(s) ? s : null);
 }
 
-export async function fetchTabCsv(sheetId, tabName) {
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}`;
+export async function fetchTabCsv(sheetId, tabName, gid = null) {
+  // Dengan gid, Google membaca tab yang PERSIS itu. Dengan nama, kalau nama tidak cocok
+  // persis Google diam-diam mengembalikan sheet PERTAMA di file — sumber data salah arah.
+  const sasaran = gid ? `gid=${encodeURIComponent(gid)}` : `sheet=${encodeURIComponent(tabName)}`;
+  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&${sasaran}`;
   const res = await fetch(url, { redirect: 'follow' });
   if (!res.ok) throw Object.assign(new Error(`Gagal membaca tab "${tabName}" (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
   const text = await res.text();
@@ -567,10 +570,26 @@ function detectDirectionFromHeaders(headerRow) {
   return null; // ambigu (mis. tab "LIST ALL ASET ...") — tidak divalidasi
 }
 
+// Nama tab yang MENYEBUT arah ("... IN", "OUT", "Barang Masuk"). Nama seperti
+// "Week RCE Jatim" / "Report MS Wunut" tidak menyebut arah → arah dibaca dari kolomnya.
+const NAMA_SEBUT_ARAH = /\b(in|out|masuk|keluar)\b/i;
+
+/**
+ * Arah sebuah tab: dari nama bila nama menyebut arah; bila tidak, dari kolom isinya
+ * (Supplier/No PO → masuk; Alokasi/PIC/No Shipment → keluar); bila tetap tidak jelas, keluar.
+ */
+export function tentukanArah(tab, rows) {
+  const dariNama = directionOf(tab);
+  if (dariNama === 'ASET' || NAMA_SEBUT_ARAH.test(tab)) return dariNama;
+  const headIdx = rows.findIndex((r) => r.some((c) => ['nama barang', 'nama aset', 'nama item'].includes(norm(c))));
+  return (headIdx >= 0 && detectDirectionFromHeaders(rows[headIdx])) || dariNama;
+}
+
 /** Lempar error kalau isi CSV ternyata bukan arah yang diharapkan dari nama tab. */
 function assertDirectionMatches(tab, rows) {
   const expected = directionOf(tab);
   if (expected === 'ASET') return; // sheet aset tidak punya pola IN/OUT
+  if (!NAMA_SEBUT_ARAH.test(tab)) return; // nama tidak menyebut arah → tidak ada yang bisa dibandingkan
   const headIdx = rows.findIndex((r) => r.some((c) => ['nama barang', 'nama aset', 'nama item'].includes(norm(c))));
   if (headIdx < 0) return; // biar rowsToRecords yang menangani (hasilnya kosong)
   const actual = detectDirectionFromHeaders(rows[headIdx]);
@@ -630,6 +649,19 @@ export async function fetchSheetTabs(sheetId) {
   return tabs;
 }
 
+// Daftar tab di-cache singkat supaya satu putaran sync (banyak tab) cukup satu kali baca.
+const cacheTab = new Map();
+async function daftarTabSheet(sheetId) {
+  const hit = cacheTab.get(sheetId);
+  if (hit && Date.now() - hit.t < 30_000) return hit.tabs;
+  let tabs = null;
+  if (process.env.SHEET_TAB_CHECK !== 'off') {
+    try { tabs = await fetchSheetTabs(sheetId); } catch { tabs = null; } // tidak terbaca → pakai cara lama
+  }
+  cacheTab.set(sheetId, { t: Date.now(), tabs });
+  return tabs;
+}
+
 const normTab = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 const KATA_ABAIKAN = new Set(['ms', 'ws', 'lng', 'mother', 'station']);
 /** Kata kunci pengenal sebuah site: key-nya + kata pada labelnya (tanpa awalan MS/WS/LNG). */
@@ -639,6 +671,55 @@ const tokenSite = (site) => {
   return [...t].filter(Boolean);
 };
 const TAB_RELEVAN = /report\s*weekly|weekly\s*report|barang\s*(masuk|keluar)|list\s*all\s*aset|\baset\b|\b(in|out)\b(\s*\(\d+\))?$/i;
+
+const rapikanTab = (t) => String(t || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+
+/**
+ * Cari tab sebenarnya di spreadsheet untuk nama yang tersimpan di pengaturan.
+ * Persis → pakai. Beda spasi/huruf besar-kecil saja → pakai tab aslinya (tidak perlu mengetik ulang).
+ * Tidak ada → error yang menyebut tab apa saja yang ada, BUKAN mengambil sheet pertama diam-diam.
+ * Daftar tab tidak terbaca (null) → perilaku lama (cari berdasarkan nama).
+ */
+export function pilihTab(daftar, nama) {
+  if (!daftar || !daftar.length) return { name: nama, gid: null };
+  const persis = daftar.find((t) => t.name === nama);
+  if (persis) return persis;
+  const mirip = daftar.filter((t) => rapikanTab(t.name) === rapikanTab(nama));
+  if (mirip.length === 1) return mirip[0];
+  const kata = new Set(rapikanTab(nama).split(/[^a-z0-9]+/).filter((w) => w.length > 1));
+  const saran = daftar.map((t) => ({ t, skor: rapikanTab(t.name).split(/[^a-z0-9]+/).filter((w) => kata.has(w)).length }))
+    .filter((x) => x.skor > 0).sort((a, b) => b.skor - a.skor).slice(0, 4).map((x) => `"${x.t.name}"`);
+  throw Object.assign(new Error(
+    `Tab "${nama}" tidak ada di spreadsheet.`
+    + (saran.length ? ` Mungkin maksud Anda: ${saran.join(', ')}.` : ` Tab yang ada: ${daftar.slice(0, 8).map((x) => `"${x.name}"`).join(', ')}${daftar.length > 8 ? ', …' : ''}.`)
+    + ' Salin-tempel nama tab dari Google Sheets ke pengaturan sumber.'
+  ), { status: 400 });
+}
+
+/**
+ * Tab yang namanya menyebut SITE LAIN (mis. tab "IN RCE Jatim" di pengaturan MS Wunut).
+ * Semua baris dari tab di pengaturan sebuah site disimpan ke site itu — jadi tab milik site
+ * lain di sini membuat datanya muncul di tempat yang salah dan kosong di site aslinya.
+ */
+export async function peringatanSiteLain(site, tabs) {
+  try {
+    const { rows: sites } = await query('SELECT key, label FROM sites');
+    return petakanTabKeSite((tabs || []).map((name) => ({ name })), sites, [])
+      .filter((t) => t.site && t.site !== site)
+      .map((t) => ({ tab: t.name, siteLain: t.site, labelLain: sites.find((x) => x.key === t.site)?.label ?? t.site }));
+  } catch { return []; }
+}
+
+/** Tarik satu tab dari Google lalu simpan. Dipakai sync manual maupun auto-sync. */
+export async function tarikSatuTab(sheetId, tab, site, importedBy, daftarTab) {
+  const asli = pilihTab(daftarTab, tab);
+  const parsed = parseCsv(await fetchTabCsv(sheetId, asli.name, asli.gid));
+  assertDirectionMatches(tab, parsed);
+  const arah = tentukanArah(tab, parsed);
+  const records = rowsToRecords(parsed, site);
+  const stat = await WeeklyReports.upsertMany(site, tab, records, importedBy, arah);
+  return { tab, arah, ...stat };
+}
 
 /**
  * Cocokkan setiap tab ke satu site.
@@ -702,8 +783,7 @@ const KOLOM_HASH = [
 const ketJumlah = (jumlah, satuan) => `${Number(jumlah) || ''} ${satuan || ''}`.trim();
 
 export const WeeklyReports = {
-  async upsertMany(site, tab, records, importedBy) {
-    const direction = directionOf(tab);
+  async upsertMany(site, tab, records, importedBy, direction = directionOf(tab)) {
     let inserted = 0, updated = 0;
     const hashesInBatch = [];
     const hashes = dedupeHashes(records);
@@ -913,7 +993,25 @@ export function weeklyReportRouter() {
     const sheetId = extractSheetId(sheetUrl);
     if (!site || !sheetId) return res.status(400).json({ error: 'Site dan URL Google Spreadsheet wajib diisi.' });
     if (!Array.isArray(tabs) || !tabs.length) return res.status(400).json({ error: 'Minimal satu nama tab wajib diisi.' });
-    res.json(await WeeklyReports.saveSource(site, sheetId, tabs, autoSync));
+    const tersimpan = await WeeklyReports.saveSource(site, sheetId, tabs, autoSync);
+    res.json({ ...tersimpan, peringatan: await peringatanSiteLain(site, tabs) });
+  }));
+
+  // Ringkasan isi database: berapa baris per site & arah, dan rentang tahunnya. Dipakai layar
+  // "belum ada data" untuk menunjukkan DI MANA data yang sudah disinkronkan benar-benar tersimpan.
+  r.get('/weekly-reports/overview', requireAuth, wrap(async (req, res) => {
+    const mine = req.auth.assignedSite;
+    const terkunci = !(req.auth.role === 'Super Admin' || mine === 'global' || !mine);
+    const site = terkunci ? mine : (req.query.site || null);
+    const { rows } = await query(
+      `SELECT site, direction, COUNT(*)::int AS jumlah,
+              MIN(NULLIF(tahun, 0)) AS tahun_min, MAX(NULLIF(tahun, 0)) AS tahun_max,
+              COUNT(*) FILTER (WHERE tahun = 0)::int AS tanpa_tahun
+         FROM weekly_report_rows
+        ${site ? 'WHERE site = $1' : ''}
+        GROUP BY site, direction ORDER BY site, direction`,
+      site ? [site] : []);
+    res.json(rows.map((x) => ({ site: x.site, direction: x.direction, jumlah: x.jumlah, tahunMin: x.tahun_min, tahunMax: x.tahun_max, tanpaTahun: x.tanpa_tahun })));
   }));
 
   // ── Hubungkan SATU spreadsheet ke banyak site (khusus akun global) ───────
@@ -980,22 +1078,15 @@ export function weeklyReportRouter() {
     if (!src) return res.status(400).json({ error: 'Sumber spreadsheet untuk site ini belum diatur.' });
 
     const hasil = [];
+    const daftarTab = await daftarTabSheet(src.sheetId);
     for (const tab of src.tabs) {
-      try {
-        const csv = await fetchTabCsv(src.sheetId, tab);
-        const parsed = parseCsv(csv);
-        assertDirectionMatches(tab, parsed);
-        const records = rowsToRecords(parsed, site);
-        const stat = await WeeklyReports.upsertMany(site, tab, records, req.auth.email);
-        hasil.push({ tab, ...stat });
-      } catch (err) {
-        hasil.push({ tab, error: err.message });
-      }
+      try { hasil.push(await tarikSatuTab(src.sheetId, tab, site, req.auth.email, daftarTab)); }
+      catch (err) { hasil.push({ tab, error: err.message }); }
     }
     const gagal = hasil.filter((h) => h.error).length;
     const dibuang = await WeeklyReports.hapusTabUsang(site, src.tabs);
     await WeeklyReports.markSync(site, gagal ? `${gagal} tab gagal` : 'OK');
-    res.json({ site, syncedAt: new Date().toISOString(), hasil, dibuang });
+    res.json({ site, syncedAt: new Date().toISOString(), hasil, dibuang, peringatan: await peringatanSiteLain(site, src.tabs) });
   }));
 
   // Import manual: frontend mengirim CSV hasil upload .xlsx/.csv.
@@ -1036,13 +1127,10 @@ export function startAutoSync(intervalMs = 5 * 60 * 1000) {
       const { rows } = await query('SELECT site, sheet_id, tabs FROM weekly_report_sources WHERE auto_sync = TRUE');
       for (const s of rows) {
         const tabsAktif = (s.tabs || '').split('|').filter(Boolean);
+        const daftarTab = await daftarTabSheet(s.sheet_id);
         for (const tab of tabsAktif) {
-          try {
-            const parsed = parseCsv(await fetchTabCsv(s.sheet_id, tab));
-            assertDirectionMatches(tab, parsed);
-            const records = rowsToRecords(parsed, s.site);
-            await WeeklyReports.upsertMany(s.site, tab, records, 'auto-sync');
-          } catch (err) { console.warn(`[weekly-sync] ${s.site}/${tab}:`, err.message); }
+          try { await tarikSatuTab(s.sheet_id, tab, s.site, 'auto-sync', daftarTab); }
+          catch (err) { console.warn(`[weekly-sync] ${s.site}/${tab}:`, err.message); }
         }
         await WeeklyReports.hapusTabUsang(s.site, tabsAktif);
         await WeeklyReports.markSync(s.site, 'OK (auto)');
