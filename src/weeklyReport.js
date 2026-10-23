@@ -443,8 +443,63 @@ const AMBANG_FUZZY = 0.5; // di bawah ini dianggap barang beda, tidak dipasangka
  * "mencuri" via fuzzy kandidat pembelian yang sebetulnya exact-match milik
  * aset lain yang belum diproses — itu pernah kejadian waktu diuji.
  */
+/**
+ * Nilai aset dari KODE yang sama di Barang Masuk atau Barang Keluar (semua site).
+ * Sheet aset tidak punya kolom harga, tetapi kode asetnya (mis. "01.11-2026-0033") biasanya
+ * juga tertulis di baris pembelian/pemakaian lengkap dengan harga. Kecocokan kode itu persis,
+ * jadi hasilnya dianggap harga tercatat (bukan estimasi):
+ *  - prioritas: site yang sama → Barang Masuk → tanggal terdekat → baris yang kuantitasnya belum habis dipakai
+ *  - harga satuan = total ÷ jumlah di baris sumber, dikali jumlah aset
+ * Hasil ditaruh di totalHarga/harga pada respons (data di database tidak diubah) beserta `sumberHarga`.
+ */
+export function cocokkanHargaKode(asetRows, sumber) {
+  const kodeAset = new Set(asetRows.filter((a) => !(a.totalHarga > 0)).map((a) => normKode(a.kode)).filter((k) => k.length >= 5));
+  if (!kodeAset.size) return;
+  const pool = new Map();
+  for (const r of sumber) {
+    const k = normKode(r.kode);
+    if (!kodeAset.has(k)) continue;
+    const jumlah = Number(r.jumlah) > 0 ? Number(r.jumlah) : 1;
+    const total = Number(r.total_harga) > 0 ? Number(r.total_harga) : Number(r.harga) * jumlah;
+    if (!(total > 0)) continue;
+    const e = { site: r.site, arah: r.direction, tanggal: r.tanggal ? new Date(r.tanggal).getTime() : null,
+      kode: r.kode, namaBarang: r.nama_barang, satuan: total / jumlah, sisa: jumlah };
+    if (!pool.has(k)) pool.set(k, []);
+    pool.get(k).push(e);
+  }
+  const urut = [...asetRows].sort((a, b) => String(a.tanggal || '').localeCompare(String(b.tanggal || '')));
+  for (const a of urut) {
+    if (a.totalHarga > 0) continue;
+    const kandidat = pool.get(normKode(a.kode));
+    if (!kandidat || !kandidat.length) continue;
+    const tglAset = a.tanggal ? new Date(a.tanggal).getTime() : null;
+    const skor = (k) => [k.site === a.site ? 0 : 1, k.sisa > 0 ? 0 : 1, k.arah === 'IN' ? 0 : 1,
+      tglAset != null && k.tanggal != null ? Math.abs(tglAset - k.tanggal) : Number.MAX_SAFE_INTEGER];
+    const banding = (x, y) => { const sx = skor(x), sy = skor(y); for (let i = 0; i < sx.length; i++) if (sx[i] !== sy[i]) return sx[i] - sy[i]; return 0; };
+    const terbaik = [...kandidat].sort(banding)[0];
+    const qty = Number(a.jumlah) > 0 ? Number(a.jumlah) : 1;
+    terbaik.sisa -= qty;
+    a.harga = Math.round(terbaik.satuan);
+    a.totalHarga = Math.round(terbaik.satuan * qty);
+    a.sumberHarga = { metode: 'kode', arah: terbaik.arah, site: terbaik.site,
+      tanggal: terbaik.tanggal ? new Date(terbaik.tanggal).toISOString().slice(0, 10) : null, kode: terbaik.kode, namaBarang: terbaik.namaBarang };
+  }
+}
+
+async function pasangHargaDariKode(asetRows) {
+  if (!asetRows.some((a) => !(a.totalHarga > 0) && normKode(a.kode).length >= 5)) return;
+  const { rows } = await query(
+    `SELECT site, direction, tanggal, kode, nama_barang, jumlah, harga, total_harga FROM weekly_report_rows
+      WHERE direction IN ('IN', 'OUT') AND kode <> '' AND (total_harga > 0 OR harga > 0)`);
+  cocokkanHargaKode(asetRows, rows);
+}
+
 async function attachEstimasiHarga(rowsHasil) {
-  const asetRows = rowsHasil.filter((r) => r.direction === 'ASET');
+  const asetSemua = rowsHasil.filter((r) => r.direction === 'ASET');
+  if (!asetSemua.length) return;
+  await pasangHargaDariKode(asetSemua);
+  // Yang sudah dapat harga dari kode tidak perlu diestimasi lagi.
+  const asetRows = asetSemua.filter((r) => !(r.totalHarga > 0));
   if (!asetRows.length) return;
   const sites = [...new Set(asetRows.map((r) => r.site))];
   const { rows: pembelian } = await query(
