@@ -1052,6 +1052,17 @@ export function weeklyReportRouter() {
     res.json({ ...tersimpan, peringatan: await peringatanSiteLain(site, tabs) });
   }));
 
+  // Daftar sumber sheet semua site (atau hanya site sendiri bagi akun terkunci) — untuk layar Site Operasional.
+  r.get('/weekly-reports/sources', requireAuth, wrap(async (req, res) => {
+    const mine = req.auth.assignedSite;
+    const terkunci = !(req.auth.role === 'Super Admin' || mine === 'global' || !mine);
+    const { rows } = await query(
+      `SELECT site, sheet_id, tabs, auto_sync, last_sync_at, last_status FROM weekly_report_sources ${terkunci ? 'WHERE site = $1' : ''} ORDER BY site`,
+      terkunci ? [mine] : []);
+    res.json(rows.map((x) => ({ site: x.site, sheetId: x.sheet_id, tabs: x.tabs ? x.tabs.split('|').filter(Boolean) : [],
+      autoSync: x.auto_sync, lastSyncAt: x.last_sync_at, lastStatus: x.last_status })));
+  }));
+
   // Ringkasan isi database: berapa baris per site & arah, dan rentang tahunnya. Dipakai layar
   // "belum ada data" untuk menunjukkan DI MANA data yang sudah disinkronkan benar-benar tersimpan.
   r.get('/weekly-reports/overview', requireAuth, wrap(async (req, res) => {
@@ -1061,12 +1072,12 @@ export function weeklyReportRouter() {
     const { rows } = await query(
       `SELECT site, direction, COUNT(*)::int AS jumlah,
               MIN(NULLIF(tahun, 0)) AS tahun_min, MAX(NULLIF(tahun, 0)) AS tahun_max,
-              COUNT(*) FILTER (WHERE tahun = 0)::int AS tanpa_tahun
+              COUNT(*) FILTER (WHERE tahun = 0)::int AS tanpa_tahun, MAX(tanggal) AS terbaru
          FROM weekly_report_rows
         ${site ? 'WHERE site = $1' : ''}
         GROUP BY site, direction ORDER BY site, direction`,
       site ? [site] : []);
-    res.json(rows.map((x) => ({ site: x.site, direction: x.direction, jumlah: x.jumlah, tahunMin: x.tahun_min, tahunMax: x.tahun_max, tanpaTahun: x.tanpa_tahun })));
+    res.json(rows.map((x) => ({ site: x.site, direction: x.direction, jumlah: x.jumlah, tahunMin: x.tahun_min, tahunMax: x.tahun_max, tanpaTahun: x.tanpa_tahun, terbaru: x.terbaru ? new Date(x.terbaru).toISOString().slice(0, 10) : null })));
   }));
 
   // ── Hubungkan SATU spreadsheet ke banyak site (khusus akun global) ───────
