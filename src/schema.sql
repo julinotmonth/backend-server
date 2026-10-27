@@ -136,3 +136,8 @@ CREATE TABLE IF NOT EXISTS work_orders (
 
 CREATE INDEX IF NOT EXISTS idx_work_orders_asset ON work_orders(asset_id);
 CREATE INDEX IF NOT EXISTS idx_work_orders_due ON work_orders(due_date);
+
+-- ── Salinan terenkripsi password akun (untuk fitur lihat password Super Admin) ──
+-- Lihat src/vault.js. Kolom ini NULL untuk akun lama sampai password-nya diatur
+-- ulang lewat Kelola Pengguna, atau sampai akun itu berhasil login sekali.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_enc TEXT;

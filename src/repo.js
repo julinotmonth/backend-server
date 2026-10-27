@@ -2,6 +2,7 @@
 // already expects (see src/types.ts) — keeping this mapping in one place
 // means every route just calls these and never touches raw SQL rows.
 import { query, withTransaction } from './db.js';
+import { openPassword } from './vault.js';
 
 const mapUser = (r) => ({
   id: r.id,
@@ -159,13 +160,23 @@ export const Users = {
     const { rows } = await query('SELECT COUNT(*)::int AS count FROM users WHERE role = $1', [role]);
     return rows[0].count;
   },
-  async insert({ id, name, email, passwordHash, position, role, assignedSite }) {
+  async insert({ id, name, email, passwordHash, passwordEnc = null, position, role, assignedSite }) {
     const { rows } = await query(
-      `INSERT INTO users (id, name, email, password_hash, position, role, assigned_site)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [id, name, email, passwordHash, position, role, assignedSite]
+      `INSERT INTO users (id, name, email, password_hash, password_enc, position, role, assigned_site)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [id, name, email, passwordHash, passwordEnc, position, role, assignedSite]
     );
     return mapUser(rows[0]);
+  },
+  /** Ganti password: hash untuk login + salinan terenkripsi untuk ditampilkan ke Super Admin. */
+  async setPassword(id, passwordHash, passwordEnc) {
+    const { rowCount } = await query('UPDATE users SET password_hash = $1, password_enc = $2 WHERE id = $3', [passwordHash, passwordEnc, id]);
+    return rowCount > 0;
+  },
+  /** { [userId]: password | null } — null bila belum tersimpan / tidak bisa dibuka. Khusus Super Admin. */
+  async credentials() {
+    const { rows } = await query('SELECT id, password_enc FROM users');
+    return Object.fromEntries(rows.map((r) => [r.id, openPassword(r.password_enc)]));
   },
   async update(id, patch) {
     const fields = [];

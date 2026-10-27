@@ -7,6 +7,8 @@ import { pool } from './db.js';
 import { migrate } from './migrate.js';
 import { Users, Sites, Categories, SpareParts, Logs, Gallery, FixedAssets, WorkOrders } from './repo.js';
 import { signToken, requireAuth, requireSuperAdmin } from './auth.js';
+import { sealPassword } from './vault.js';
+import { searchRouter } from './search.js';
 import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weeklyReport.js';
 import { PICA_SCHEMA, picaRouter, startPicaAutoSync } from './pica.js';
 import { WORK_TARGET_SCHEMA, workTargetRouter, startWorkTargetAutoSync } from './workTarget.js';
@@ -81,6 +83,12 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     return res.status(401).json({ error: 'Email atau password salah.' });
   }
   loginFails.delete(key);
+  // Akun lama belum punya salinan terenkripsi — isi sekarang (password baru saja terverifikasi)
+  // supaya muncul di Kelola Pengguna. Gagal menyimpan tidak boleh menggagalkan login.
+  if (!row.password_enc) {
+    try { await Users.setPassword(row.id, row.password_hash, sealPassword(password)); }
+    catch (err) { console.warn('[auth] Gagal menyimpan salinan password:', err.message); }
+  }
   const user = await Users.findById(row.id);
   const token = signToken(user);
   res.json({ token, user });
@@ -97,25 +105,51 @@ app.get('/api/users', requireAuth, requireSuperAdmin, asyncRoute(async (_req, re
   res.json(await Users.all());
 }));
 
+const MIN_PASSWORD = 6;
+const MAX_PASSWORD = 72; // batas bcrypt
+/** Mengembalikan pesan error bila password tidak layak, atau null bila OK. */
+const cekPassword = (pw) => {
+  if (typeof pw !== 'string') return 'Password harus berupa teks.';
+  if (pw.length < MIN_PASSWORD) return `Password minimal ${MIN_PASSWORD} karakter.`;
+  if (Buffer.byteLength(pw, 'utf8') > MAX_PASSWORD) return `Password terlalu panjang (maksimal ${MAX_PASSWORD} karakter).`;
+  if (pw !== pw.trim()) return 'Password tidak boleh diawali atau diakhiri spasi.';
+  return null;
+};
+
+// Password semua akun (untuk ditampilkan di Kelola Pengguna). Hanya Super Admin; jangan di-cache.
+app.get('/api/users/credentials', requireAuth, requireSuperAdmin, asyncRoute(async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(await Users.credentials());
+}));
+
 app.post('/api/users', requireAuth, requireSuperAdmin, asyncRoute(async (req, res) => {
-  const { name, email, position, role, assignedSite, avatarUrl } = req.body || {};
+  const { name, email, position, role, assignedSite, avatarUrl, password } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: 'Nama dan email wajib diisi.' });
   if (await Users.findByEmail(email)) {
     return res.status(409).json({ error: 'Email tersebut sudah terdaftar.' });
   }
-  const temporaryPassword = crypto.randomBytes(9).toString('base64url'); // 12 karakter acak
+  // Password dipilih sendiri oleh Super Admin; bila dikosongkan dibuatkan password acak.
+  const diisiSendiri = password !== undefined && password !== null && password !== '';
+  if (diisiSendiri) {
+    const salah = cekPassword(password);
+    if (salah) return res.status(400).json({ error: salah });
+  }
+  const finalPassword = diisiSendiri ? password : crypto.randomBytes(9).toString('base64url'); // 12 karakter acak
   const user = await Users.insert({
     id: `user-${Date.now().toString(36)}`,
     name,
     email,
-    // Password sementara acak, ditampilkan SEKALI ke Super Admin yang membuat akun.
-    passwordHash: bcrypt.hashSync(temporaryPassword, 10),
+    passwordHash: bcrypt.hashSync(finalPassword, 10),
+    passwordEnc: sealPassword(finalPassword),
     position: position || role || 'Anggota Tim',
     role: role || 'Site Manager',
     assignedSite: assignedSite || 'global',
   });
   if (avatarUrl) await Users.update(user.id, { avatarUrl });
-  res.status(201).json({ ...(await Users.findById(user.id)), temporaryPassword });
+  res.status(201).json({
+    ...(await Users.findById(user.id)),
+    ...(diisiSendiri ? {} : { temporaryPassword: finalPassword }),
+  });
 }));
 
 app.patch('/api/users/:id', requireAuth, asyncRoute(async (req, res) => {
@@ -126,6 +160,8 @@ app.patch('/api/users/:id', requireAuth, asyncRoute(async (req, res) => {
     return res.status(403).json({ error: 'Anda hanya bisa mengubah profil Anda sendiri.' });
   }
   const patch = { ...req.body };
+  const newPassword = patch.password;
+  delete patch.password; // ditangani terpisah di bawah — bukan kolom biasa
   delete patch.id;
   delete patch.email; // email is immutable after creation, matching the frontend form
   if (!isSuperAdmin) {
@@ -134,8 +170,16 @@ app.patch('/api/users/:id', requireAuth, asyncRoute(async (req, res) => {
     delete patch.role;
     delete patch.assignedSite;
   }
+  // Mengganti password hanya boleh oleh Super Admin (kolom kosong = tidak diubah).
+  const mauGantiPassword = newPassword !== undefined && newPassword !== null && newPassword !== '';
+  if (mauGantiPassword) {
+    if (!isSuperAdmin) return res.status(403).json({ error: 'Hanya Super Admin yang bisa mengganti password.' });
+    const salah = cekPassword(newPassword);
+    if (salah) return res.status(400).json({ error: salah });
+  }
   const updated = await Users.update(id, patch);
   if (!updated) return res.status(404).json({ error: 'Akun tidak ditemukan.' });
+  if (mauGantiPassword) await Users.setPassword(id, bcrypt.hashSync(newPassword, 10), sealPassword(newPassword));
   res.json(updated);
 }));
 
@@ -442,6 +486,7 @@ app.use('/api', workTargetRouter());
 app.use('/api', minStockRouter());          // ← Pencapaian Minimum Stok
 app.use('/api', outstandingPrRouter());     // ← Outstanding PR
 app.use('/api', changeLogRouter());       // ← notifikasi perubahan Laporan Mingguan
+app.use('/api', searchRouter());          // ← Global Search (Laporan Mingguan + PICA)
 
 app.use((req, res) => res.status(404).json({ error: `No route: ${req.method} ${req.path}` }));
 

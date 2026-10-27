@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { pool, query } from './db.js';
+import { sealPassword } from './vault.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Password bawaan versi lama. Dipertahankan HANYA agar akun lama yang masih
@@ -95,9 +96,9 @@ async function ensureAdminAccount() {
     const devEmail = 'admin@reethau.local';
     const devPassword = crypto.randomBytes(12).toString('base64url');
     await query(
-      `INSERT INTO users (id, name, email, password_hash, position, role, assigned_site)
-       VALUES ('user-admin', $1, $2, $3, 'Super Admin', 'Super Admin', 'global')`,
-      [name, devEmail, bcrypt.hashSync(devPassword, 10)]
+      `INSERT INTO users (id, name, email, password_hash, password_enc, position, role, assigned_site)
+       VALUES ('user-admin', $1, $2, $3, $4, 'Super Admin', 'Super Admin', 'global')`,
+      [name, devEmail, bcrypt.hashSync(devPassword, 10), sealPassword(devPassword)]
     );
     console.log(`[migrate] ADMIN_EMAIL/ADMIN_PASSWORD tidak diatur. Akun dev dibuat — email: ${devEmail}  password: ${devPassword}  (tampil sekali, simpan sekarang)`);
     return;
@@ -114,9 +115,9 @@ async function ensureAdminAccount() {
       throw new Error('ADMIN_EMAIL sudah dipakai akun lain; pilih email yang berbeda.');
     }
     await query(
-      `INSERT INTO users (id, name, email, password_hash, position, role, assigned_site)
-       VALUES ('user-admin', $1, $2, $3, 'Super Admin', 'Super Admin', 'global')`,
-      [name, email, bcrypt.hashSync(password, 10)]
+      `INSERT INTO users (id, name, email, password_hash, password_enc, position, role, assigned_site)
+       VALUES ('user-admin', $1, $2, $3, $4, 'Super Admin', 'Super Admin', 'global')`,
+      [name, email, bcrypt.hashSync(password, 10), sealPassword(password)]
     );
     console.log(`[migrate] Akun Super Admin dibuat (${email}).`);
     return;
@@ -125,14 +126,20 @@ async function ensureAdminAccount() {
   const current = rows[0];
   const emailChanged = current.email.toLowerCase() !== email.toLowerCase();
   const passwordChanged = !bcrypt.compareSync(password, current.password_hash);
-  if (!emailChanged && !passwordChanged) return;
+  if (!emailChanged && !passwordChanged) {
+    // Tidak ada perubahan kredensial — cukup pastikan salinan terenkripsinya ada
+    // supaya password admin juga tampil di Kelola Pengguna.
+    if (!current.password_enc) await query('UPDATE users SET password_enc = $1 WHERE id = $2', [sealPassword(password), current.id]);
+    return;
+  }
   if (emailChanged) {
     const { rows: taken } = await query('SELECT 1 FROM users WHERE lower(email) = lower($1) AND id <> $2', [email, current.id]);
     if (taken.length > 0) throw new Error('ADMIN_EMAIL sudah dipakai akun lain; pilih email yang berbeda.');
   }
-  await query('UPDATE users SET email = $1, password_hash = $2 WHERE id = $3', [
+  await query('UPDATE users SET email = $1, password_hash = $2, password_enc = $3 WHERE id = $4', [
     email,
     passwordChanged ? bcrypt.hashSync(password, 10) : current.password_hash,
+    sealPassword(password),
     current.id,
   ]);
   console.log(`[migrate] Kredensial Super Admin diperbarui dari environment (${[emailChanged && 'email', passwordChanged && 'password'].filter(Boolean).join(' + ')}).`);
@@ -146,7 +153,7 @@ async function retireLegacyDefaultPasswords() {
   const { rows } = await query('SELECT id, email, password_hash FROM users');
   for (const u of rows) {
     if (!bcrypt.compareSync(LEGACY_DEFAULT_PASSWORD, u.password_hash)) continue;
-    await query('UPDATE users SET password_hash = $1 WHERE id = $2', [
+    await query('UPDATE users SET password_hash = $1, password_enc = NULL WHERE id = $2', [
       bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10),
       u.id,
     ]);
