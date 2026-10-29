@@ -24,8 +24,24 @@ const DEFAULT_SITE_KEYS = ['indramayu', 'blora', 'setu'];
 const app = express();
 if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || true); // di belakang nginx/Cloudflare/dll.
 // Di production sebaiknya batasi origin: CORS_ORIGIN=https://domain-anda.com (pisahkan koma bila lebih dari satu).
-app.use(cors(process.env.CORS_ORIGIN ? { origin: process.env.CORS_ORIGIN.split(',').map((o) => o.trim()) } : undefined));
-app.use(express.json({ limit: '12mb' })); // generous limit — uploaded photos are sent as base64 data URLs
+// maxAge: browser menyimpan hasil preflight (OPTIONS) sehingga tidak ada request OPTIONS ekstra
+// di setiap panggilan API (header Authorization memicu preflight) — hemat satu round trip per request.
+app.use(cors({
+  maxAge: 7200,
+  ...(process.env.CORS_ORIGIN ? { origin: process.env.CORS_ORIGIN.split(',').map((o) => o.trim()) } : {}),
+}));
+app.use(express.json({ limit: '12mb' }));
+
+// Kesiapan: server mulai mendengarkan SEGERA saat proses menyala (tanpa menunggu migrasi DB), dan
+// selama belum siap menjawab 503 + Retry-After. Dulu port belum terbuka sampai migrasi selesai,
+// sehingga proxy hosting membalas error tanpa header CORS — di browser tampil sebagai "CORS" /
+// ERR_FAILED. Respons 503 dari sini membawa header CORS, dan frontend otomatis mencoba lagi.
+let siap = false;
+app.get('/api/ping', (_req, res) => res.json({ ok: true, siap })); // ringan, tanpa DB — untuk membangunkan server
+app.use('/api', (_req, res, next) => {
+  if (siap) return next();
+  res.set('Retry-After', '2').status(503).json({ error: 'Server sedang menyiapkan diri. Coba lagi sebentar.' });
+}); // generous limit — uploaded photos are sent as base64 data URLs
 
 const nowTimestamp = () => {
   const d = new Date();
@@ -497,6 +513,15 @@ app.use((err, _req, res, _next) => {
 });
 
 async function start() {
+  const server = app.listen(PORT, () => {
+    console.log(`[server] Reethau Inventory API listening on http://localhost:${PORT}`);
+  });
+  // Di belakang proxy/load balancer (SnapDeploy, Cloudflare, nginx, …) keep-alive Node bawaan hanya 5 dtk —
+  // lebih pendek dari timeout idle proxy, sehingga sesekali proxy memakai koneksi yang sudah ditutup Node
+  // dan pengguna melihat error acak. Dibuat lebih panjang dari proxy pada umumnya (60 dtk).
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+
   await migrate();
   await pool.query(WEEKLY_REPORT_SCHEMA);   // ← tabel laporan mingguan
   await pool.query(PICA_SCHEMA);            // ← tabel PICA tracker
@@ -506,15 +531,35 @@ async function start() {
   await pool.query(CHANGE_LOG_SCHEMA);      // ← tabel log perubahan (notifikasi)
   await sesuaikanSite();                    // ← WS Dawuan → WS Cibungur, hapus MS Bekasi (bila kosong)
   await rapikanSiteKembar();                // ← buang site kembar yang kosong (mis. "LNG Sangkulirang" ganda)
-  startAutoSync();                           // ← tarik ulang sheet tiap 5 menit
-  startPicaAutoSync();                       // ← idem, untuk PICA
-  startWorkTargetAutoSync();                 // ← idem, untuk Work Target
-  startMinStockAutoSync();                   // ← idem, untuk Pencapaian Minimum Stok
-  startOutstandingPrAutoSync();              // ← idem, untuk Outstanding PR
-  app.listen(PORT, () => {
-    console.log(`[server] Reethau Inventory API listening on http://localhost:${PORT}`);
-  });
+  siap = true;
+  console.log('[server] Siap melayani permintaan.');
+
+  // Auto-sync dinyalakan SETELAH server siap dan dengan jeda bertingkat. Dulu keempatnya langsung
+  // jalan serentak saat server bangun — tepat ketika pengguna mengirim request pertamanya — sehingga
+  // request itu lambat atau gagal.
+  startAutoSync();                           // ← Laporan Mingguan (mulai +30 dtk)
+  startPicaAutoSync();                       // ← PICA            (+45 dtk)
+  startWorkTargetAutoSync();                 // ← Work Target     (+60 dtk)
+  startMinStockAutoSync();                   // ← Safety Stock    (+75 dtk)
+  startOutstandingPrAutoSync();              // ← Outstanding PR  (+90 dtk)
+
+  // Berhenti dengan rapi saat container dimatikan/tidur: selesaikan request yang berjalan, tutup koneksi DB.
+  let berhenti = false;
+  const matikan = (sinyal) => {
+    if (berhenti) return;
+    berhenti = true;
+    console.log(`[server] ${sinyal} diterima — berhenti dengan rapi…`);
+    setTimeout(() => process.exit(0), 8_000).unref();
+    server.close(() => pool.end().finally(() => process.exit(0)));
+  };
+  process.on('SIGTERM', () => matikan('SIGTERM'));
+  process.on('SIGINT', () => matikan('SIGINT'));
 }
+
+// Kegagalan di pekerjaan latar belakang (mis. satu sync) tidak boleh mematikan seluruh server —
+// proses yang mati = container restart = semua request pengguna gagal sesaat.
+process.on('unhandledRejection', (err) => console.error('[server] unhandledRejection:', err));
+process.on('uncaughtException', (err) => console.error('[server] uncaughtException:', err));
 
 start().catch((err) => {
   console.error('[server] Failed to start:', err);

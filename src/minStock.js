@@ -23,6 +23,7 @@
 
 import express from 'express';
 import { query } from './db.js';
+import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { requireAuth } from './auth.js';
 import { parseCsv } from './weeklyReport.js';
 import { extractSheetId, extractGid } from './workTarget.js';
@@ -255,17 +256,11 @@ export function parseMinStockCsv(csvText) {
 
 // ── Ambil CSV dari Google Sheets ───────────────────────────────────────────
 async function fetchCsvByGid(sheetId, gid) {
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
-  let res;
-  try {
-    res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(25_000) });
-  } catch (err) {
-    throw Object.assign(new Error(`Tidak bisa menghubungi Google Sheets (${err.name === 'TimeoutError' ? 'timeout' : err.message}).`), { status: 502 });
+  const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
+  const { ok, status, text } = await fetchGoogleText(url);
+  if (!ok) {
+    throw Object.assign(new Error(`Gagal membaca sheet (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
   }
-  if (!res.ok) {
-    throw Object.assign(new Error(`Gagal membaca sheet (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
-  }
-  const text = await res.text();
   if (text.trimStart().startsWith('<')) {
     throw Object.assign(new Error('Sheet tidak bisa diakses publik. Ubah izin berbagi sheet menjadi "Anyone with the link — Viewer".'), { status: 400 });
   }
@@ -379,7 +374,10 @@ export function minStockRouter() {
 
 /** Auto-sync berkala (sama polanya dengan Work Target / PICA). */
 export function startMinStockAutoSync(intervalMs = 5 * 60 * 1000) {
+  let berjalan = false;
   const tick = async () => {
+    if (berjalan) return; // putaran lama belum selesai — jangan bertumpuk
+    berjalan = true;
     try {
       const r = await MinStock.row();
       if (!r || !r.sheet_id || !r.auto_sync) return;
@@ -387,8 +385,11 @@ export function startMinStockAutoSync(intervalMs = 5 * 60 * 1000) {
     } catch (err) {
       console.warn('[min-stock] auto-sync gagal:', err.message);
       try { await MinStock.markSync(err.message); } catch { /* noop */ }
+    } finally {
+      berjalan = false;
     }
   };
-  tick();
+  // Jeda awal bertingkat (lihat index.js) supaya tidak semua sync menyerbu saat server baru bangun.
+  setTimeout(tick, 75000).unref();
   setInterval(tick, intervalMs).unref();
 }

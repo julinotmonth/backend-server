@@ -7,7 +7,8 @@
 // CSV (gviz) sehingga tidak kena CORS dan bisa dijadwalkan otomatis.
 
 import express from 'express';
-import { query } from './db.js';
+import { query, withTransaction } from './db.js';
+import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { requireAuth } from './auth.js';
 import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
 
@@ -583,10 +584,10 @@ export async function fetchTabCsv(sheetId, tabName, gid = null) {
   // Dengan gid, Google membaca tab yang PERSIS itu. Dengan nama, kalau nama tidak cocok
   // persis Google diam-diam mengembalikan sheet PERTAMA di file — sumber data salah arah.
   const sasaran = gid ? `gid=${encodeURIComponent(gid)}` : `sheet=${encodeURIComponent(tabName)}`;
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&${sasaran}`;
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) throw Object.assign(new Error(`Gagal membaca tab "${tabName}" (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
-  const text = await res.text();
+  const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&${sasaran}`;
+  // Timeout + ulang otomatis untuk gangguan sementara (lihat googleFetch.js).
+  const { ok, status, text } = await fetchGoogleText(url);
+  if (!ok) throw Object.assign(new Error(`Gagal membaca tab "${tabName}" (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
   if (text.trimStart().startsWith('<')) throw Object.assign(new Error(`Tab "${tabName}" tidak bisa diakses publik. Ubah izin berbagi sheet menjadi "Anyone with the link".`), { status: 400 });
   return text;
 }
@@ -697,9 +698,9 @@ export function parseSheetTabs(html) {
 }
 
 export async function fetchSheetTabs(sheetId) {
-  const res = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/htmlview`, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`Google menolak akses daftar tab (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`);
-  const tabs = parseSheetTabs(await res.text());
+  const { ok, status, text } = await fetchGoogleText(`${SHEETS_BASE}/spreadsheets/d/${sheetId}/htmlview`, { retries: 1 });
+  if (!ok) throw new Error(`Google menolak akses daftar tab (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`);
+  const tabs = parseSheetTabs(text);
   if (!tabs.length) throw new Error('Daftar tab tidak terbaca dari halaman Google. Tempel nama tab secara manual.');
   return tabs;
 }
@@ -837,98 +838,120 @@ const KOLOM_HASH = [
 ];
 const ketJumlah = (jumlah, satuan) => `${Number(jumlah) || ''} ${satuan || ''}`.trim();
 
+// ── Insert massal ─────────────────────────────────────────────────────────
+// 29 kolom × 250 baris = 7.250 parameter per query (batas PostgreSQL 65.535).
+const BATCH_UPSERT = 250;
+const KOLOM_INSERT = ['id', 'site', 'direction', 'source_tab', 'row_hash', 'tanggal', 'minggu', 'bulan', 'tahun', 'kode',
+  'nama_barang', 'jumlah', 'satuan', 'alokasi', 'detail_alokasi', 'pic', 'rh', 'harga', 'total_harga',
+  'no_mr', 'gen_bus', 'status_smr', 'no_shipment', 'keterangan', 'jenis', 'merk', 'tipe', 'section', 'imported_by'];
+// Kolom yang di-refresh saat baris sudah ada (SEMUA kolom data, bukan sebagian — lihat catatan lama:
+// kolom yang tidak disebut di sini macet selamanya di nilai sync pertama).
+const KOLOM_REFRESH = KOLOM_INSERT.filter((k) => !['id', 'site', 'direction', 'row_hash', 'imported_by'].includes(k));
+const sqlUpsertBatch = (n) => {
+  const nk = KOLOM_INSERT.length;
+  const nilai = Array.from({ length: n }, (_, i) => `(${Array.from({ length: nk }, (_, j) => `$${i * nk + j + 1}`).join(',')})`).join(',');
+  return `INSERT INTO weekly_report_rows (${KOLOM_INSERT.join(', ')}) VALUES ${nilai}
+    ON CONFLICT (site, direction, row_hash) DO UPDATE SET
+      ${KOLOM_REFRESH.map((k) => `${k}=EXCLUDED.${k}`).join(', ')}, imported_at=NOW(), imported_by=EXCLUDED.imported_by
+    WHERE (${KOLOM_REFRESH.map((k) => `weekly_report_rows.${k}`).join(', ')})
+          IS DISTINCT FROM (${KOLOM_REFRESH.map((k) => `EXCLUDED.${k}`).join(', ')})
+    RETURNING (xmax = 0) AS is_new`;
+};
+
 export const WeeklyReports = {
+  /**
+   * Simpan hasil tarikan satu tab. Dulu: 1 query INSERT per baris, berurutan, tanpa transaksi
+   * (ratusan–ribuan round trip ke DB per tab — penyebab utama "Sync Sekarang" lama & timeout).
+   * Sekarang: seluruh tab dalam SATU transaksi dengan insert massal (beberapa ratus baris per
+   * query), jadi atomik (gagal di tengah → tidak ada data setengah jadi) dan jauh lebih cepat.
+   *
+   * Kunci advisory per (site, arah, tab) membuat dua sync yang berjalan bersamaan (mis. auto-sync
+   * dan klik manual) antre, bukan saling menimpa; yang kedua membaca keadaan terbaru sehingga
+   * perubahan yang sama tidak tercatat dua kali di notifikasi.
+   *
+   * `updated` kini = baris lama yang isinya BENAR-BENAR berubah (baris identik dilewati, tidak
+   * ditulis ulang), sehingga auto-sync tiap 5 menit tidak lagi menulis ulang ribuan baris yang sama.
+   */
   async upsertMany(site, tab, records, importedBy, direction = directionOf(tab)) {
-    let inserted = 0, updated = 0;
-    const hashesInBatch = [];
     const hashes = dedupeHashes(records);
-    // Isi lama (sebelum ditimpa) — dasar untuk mendeteksi perubahan nyata,
-    // karena `updated` di bawah menghitung SEMUA baris yang sudah ada.
-    const { rows: lamaRows } = await query(
-      `SELECT row_hash, tanggal, kode, nama_barang, jumlah, satuan, alokasi, detail_alokasi, pic, harga,
-              total_harga, no_mr, status_smr, no_shipment, keterangan, jenis, merk, tipe
-         FROM weekly_report_rows WHERE site = $1 AND direction = $2 AND source_tab = $3`,
-      [site, direction, tab]);
-    const lama = new Map(lamaRows.map((x) => [x.row_hash, x]));
-    const barisBaru = [], ubahDiTempat = [];
-    for (let i = 0; i < records.length; i++) {
-      const r = records[i];
-      const hash = hashes[i];
-      hashesInBatch.push(hash);
-      const { rows } = await query(
-        `INSERT INTO weekly_report_rows
-           (id, site, direction, source_tab, row_hash, tanggal, minggu, bulan, tahun, kode,
-            nama_barang, jumlah, satuan, alokasi, detail_alokasi, pic, rh, harga, total_harga,
-            no_mr, gen_bus, status_smr, no_shipment, keterangan, jenis, merk, tipe, section, imported_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
-         ON CONFLICT (site, direction, row_hash) DO UPDATE SET
-           -- Refresh SEMUA kolom yang bisa berubah antar-sync, bukan sebagian.
-           -- Sebelumnya cuma sebagian kolom (mis. jenis/merk/tipe) yang
-           -- disebut di sini, jadi kolom lain (detail_alokasi/pic/rh/dll)
-           -- macet selamanya di nilai hasil sync PERTAMA — walau hasil parsing
-           -- di sync berikutnya sudah benar, karena baris yang row_hash-nya
-           -- sama kena UPDATE, bukan INSERT baru, dan kolom yg tidak disebut
-           -- di sini tidak pernah tersentuh lagi.
-           source_tab=EXCLUDED.source_tab, tanggal=EXCLUDED.tanggal,
-           minggu=EXCLUDED.minggu, bulan=EXCLUDED.bulan, tahun=EXCLUDED.tahun,
-           kode=EXCLUDED.kode, nama_barang=EXCLUDED.nama_barang,
-           jumlah=EXCLUDED.jumlah, satuan=EXCLUDED.satuan, alokasi=EXCLUDED.alokasi,
-           detail_alokasi=EXCLUDED.detail_alokasi, pic=EXCLUDED.pic, rh=EXCLUDED.rh,
-           harga=EXCLUDED.harga, total_harga=EXCLUDED.total_harga,
-           no_mr=EXCLUDED.no_mr, gen_bus=EXCLUDED.gen_bus, status_smr=EXCLUDED.status_smr,
-           no_shipment=EXCLUDED.no_shipment, keterangan=EXCLUDED.keterangan,
-           jenis=EXCLUDED.jenis, merk=EXCLUDED.merk, tipe=EXCLUDED.tipe,
-           section=EXCLUDED.section, imported_at=NOW(), imported_by=EXCLUDED.imported_by
-         RETURNING (xmax = 0) AS is_new`,
-        [`wr-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`, site, direction, tab, hash,
-         r.tanggal, r.minggu, r.bulan, r.tahun, r.kode, r.namaBarang, r.jumlah, r.satuan, r.alokasi,
-         r.detailAlokasi, r.pic, r.rh, r.harga, r.totalHarga, r.noMr, r.genBus, r.statusSmr,
-         r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section, importedBy]
-      );
-      rows[0].is_new ? inserted++ : updated++;
-      const ada = lama.get(hash);
-      if (!ada) barisBaru.push(r);
-      else {
-        const perubahan = bandingkan(ada, r, KOLOM_UPDATE);
-        if (perubahan.length) ubahDiTempat.push({ pic: r.pic || ada.pic, nama: r.namaBarang, ket: ketJumlah(r.jumlah, r.satuan), perubahan });
+    const hasil = await withTransaction(async (db) => {
+      await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`wr:${site}:${direction}:${tab}`]);
+      // Isi lama (sebelum ditimpa) — dasar untuk mendeteksi perubahan nyata.
+      const { rows: lamaRows } = await db.query(
+        `SELECT row_hash, tanggal, kode, nama_barang, jumlah, satuan, alokasi, detail_alokasi, pic, harga,
+                total_harga, no_mr, status_smr, no_shipment, keterangan, jenis, merk, tipe
+           FROM weekly_report_rows WHERE site = $1 AND direction = $2 AND source_tab = $3`,
+        [site, direction, tab]);
+      const lama = new Map(lamaRows.map((x) => [x.row_hash, x]));
+      const barisBaru = [], ubahDiTempat = [];
+      let inserted = 0, updated = 0;
+
+      for (let mulai = 0; mulai < records.length; mulai += BATCH_UPSERT) {
+        const potong = records.slice(mulai, mulai + BATCH_UPSERT);
+        const params = [];
+        potong.forEach((r, i) => {
+          params.push(
+            `wr-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`, site, direction, tab, hashes[mulai + i],
+            r.tanggal, r.minggu, r.bulan, r.tahun, r.kode, r.namaBarang, r.jumlah, r.satuan, r.alokasi,
+            r.detailAlokasi, r.pic, r.rh, r.harga, r.totalHarga, r.noMr, r.genBus, r.statusSmr,
+            r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section, importedBy);
+        });
+        const { rows } = await db.query(sqlUpsertBatch(potong.length), params);
+        for (const x of rows) { if (x.is_new) inserted++; else updated++; }
+      }
+      for (let i = 0; i < records.length; i++) {
+        const r = records[i];
+        const ada = lama.get(hashes[i]);
+        if (!ada) barisBaru.push(r);
+        else {
+          const perubahan = bandingkan(ada, r, KOLOM_UPDATE);
+          if (perubahan.length) ubahDiTempat.push({ pic: r.pic || ada.pic, nama: r.namaBarang, ket: ketJumlah(r.jumlah, r.satuan), perubahan });
+        }
+      }
+      // Baris yang tabnya sama (site+direction+source_tab) tapi hash-nya tidak
+      // ada di batch saat ini berarti sudah tidak relevan lagi → dihapus.
+      // Dijaga supaya tidak jalan kalau batch kosong (mis. fetch gagal/tab
+      // kosong sementara) — kalau tidak, semua baris lama malah ikut terhapus.
+      let removed = 0;
+      if (hashes.length > 0) {
+        const res = await db.query(
+          `DELETE FROM weekly_report_rows
+            WHERE site = $1 AND direction = $2 AND source_tab = $3
+              AND NOT (row_hash = ANY($4::text[]))`,
+          [site, direction, tab, hashes]);
+        removed = res.rowCount;
+      }
+      return { inserted, updated, removed, lama, barisBaru, ubahDiTempat };
+    });
+
+    // Log perubahan untuk notifikasi (setelah commit). Sinkron pertama (tab masih kosong) hanya
+    // baseline — tidak dicatat, supaya ratusan baris awal tidak membanjiri notifikasi.
+    // Gagal mencatat notifikasi tidak boleh menggagalkan sync yang datanya sudah tersimpan.
+    const { lama, barisBaru, ubahDiTempat } = hasil;
+    if (lama.size > 0) {
+      try {
+        const batch = new Set(hashes);
+        const hilang = hashes.length > 0 ? [...lama].filter(([h]) => !batch.has(h)).map(([, v]) => v) : [];
+        const kunciRec = (b) => [b.tanggal || '', normKode(b.kode), normNama(b.namaBarang)].join('|');
+        const kunciDb = (l) => [l.tanggal ? String(l.tanggal).slice(0, 10) : '', normKode(l.kode), normNama(l.nama_barang)].join('|');
+        const { baru, ubah, hapus } = pasangkan(barisBaru, hilang, kunciRec, kunciDb);
+        await catatPerubahan({
+          site, area: direction, sumber: importedBy,
+          baru: baru.map((b) => ({ pic: b.pic, nama: b.namaBarang, ket: ketJumlah(b.jumlah, b.satuan) })),
+          ubah: [
+            ...ubahDiTempat,
+            ...ubah.map(({ lama: l, baru: b }) => ({
+              pic: b.pic || l.pic, nama: b.namaBarang, ket: ketJumlah(b.jumlah, b.satuan),
+              perubahan: bandingkan(l, b, [...KOLOM_HASH, ...KOLOM_UPDATE]),
+            })).filter((u) => u.perubahan.length),
+          ],
+          hapus: hapus.map((l) => ({ pic: l.pic, nama: l.nama_barang, ket: ketJumlah(l.jumlah, l.satuan) })),
+        });
+      } catch (err) {
+        console.warn(`[weekly-sync] ${site}/${tab}: gagal mencatat notifikasi perubahan:`, err.message);
       }
     }
-    // Baris yang tabnya sama (site+direction+source_tab) tapi hash-nya tidak
-    // ada di batch saat ini berarti sudah tidak relevan lagi → dihapus.
-    // Dijaga supaya tidak jalan kalau batch kosong (mis. fetch gagal/tab
-    // kosong sementara) — kalau tidak, semua baris lama malah ikut terhapus.
-    let removed = 0;
-    if (hashesInBatch.length > 0) {
-      const res = await query(
-        `DELETE FROM weekly_report_rows
-          WHERE site = $1 AND direction = $2 AND source_tab = $3
-            AND NOT (row_hash = ANY($4::text[]))`,
-        [site, direction, tab, hashesInBatch]
-      );
-      removed = res.rowCount;
-    }
-    // Log perubahan untuk notifikasi. Sinkron pertama (tab masih kosong) hanya
-    // baseline — tidak dicatat, supaya ratusan baris awal tidak membanjiri notifikasi.
-    if (lama.size > 0) {
-      const batch = new Set(hashesInBatch);
-      const hilang = hashesInBatch.length > 0 ? [...lama].filter(([h]) => !batch.has(h)).map(([, v]) => v) : [];
-      const kunciRec = (b) => [b.tanggal || '', normKode(b.kode), normNama(b.namaBarang)].join('|');
-      const kunciDb = (l) => [l.tanggal ? String(l.tanggal).slice(0, 10) : '', normKode(l.kode), normNama(l.nama_barang)].join('|');
-      const { baru, ubah, hapus } = pasangkan(barisBaru, hilang, kunciRec, kunciDb);
-      await catatPerubahan({
-        site, area: direction, sumber: importedBy,
-        baru: baru.map((b) => ({ pic: b.pic, nama: b.namaBarang, ket: ketJumlah(b.jumlah, b.satuan) })),
-        ubah: [
-          ...ubahDiTempat,
-          ...ubah.map(({ lama: l, baru: b }) => ({
-            pic: b.pic || l.pic, nama: b.namaBarang, ket: ketJumlah(b.jumlah, b.satuan),
-            perubahan: bandingkan(l, b, [...KOLOM_HASH, ...KOLOM_UPDATE]),
-          })).filter((u) => u.perubahan.length),
-        ],
-        hapus: hapus.map((l) => ({ pic: l.pic, nama: l.nama_barang, ket: ketJumlah(l.jumlah, l.satuan) })),
-      });
-    }
-    return { inserted, updated, removed, total: records.length };
+    return { inserted: hasil.inserted, updated: hasil.updated, removed: hasil.removed, total: records.length };
   },
 
   async list({ site, tahun, bulan, direction }) {
@@ -1015,6 +1038,84 @@ export const WeeklyReports = {
       [site, Number(tahun), Number(minggu), Number(m3) || 0]);
   },
 };
+
+// ── Orkestrasi sync ───────────────────────────────────────────────────────
+// Satu "job" = satu putaran sync untuk satu site. Aturan:
+//   • Per site hanya SATU job berjalan. Klik "Sync Sekarang" saat auto-sync (atau klik kedua)
+//     sedang berjalan → bergabung ke job yang ada, bukan memulai pekerjaan ganda.
+//   • Job berjalan di latar belakang dan dibaca lewat polling (GET /weekly-reports/sync/:id),
+//     jadi tidak ada request panjang yang bisa diputus proxy/hosting (penyebab error CORS /
+//     ERR_FAILED di browser: respons error dari proxy tidak membawa header CORS).
+//   • Tab dalam satu site ditarik paralel terbatas; kegagalan satu tab tidak menghentikan yang lain.
+const SYNC_PARALEL = 2;
+const JOB_SIMPAN_MS = 15 * 60_000;
+const syncAktif = new Map();   // site -> job yang sedang berjalan
+const daftarJob = new Map();   // id -> job (disimpan sebentar agar hasilnya bisa dibaca klien)
+
+async function dalamBatas(items, batas, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(batas, items.length) }, async () => {
+    while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); }
+  }));
+  return out;
+}
+
+function bersihkanJob() {
+  const batas = Date.now() - JOB_SIMPAN_MS;
+  for (const [id, j] of daftarJob) if (j.selesai && j.selesai < batas) daftarJob.delete(id);
+}
+
+/** Bagian job yang aman dikirim ke klien (tanpa promise internal). */
+const tampilanJob = (j, bergabung = false) => ({
+  id: j.id, site: j.site, status: j.status, mulai: j.mulai, selesai: j.selesai,
+  progress: j.progress, hasil: j.hasil, dibuang: j.dibuang, peringatan: j.peringatan, error: j.error, bergabung,
+});
+
+/** Mulai sync untuk satu site, atau bergabung ke job yang sedang berjalan. */
+export function mulaiSync(site, src, oleh) {
+  const ada = syncAktif.get(site);
+  if (ada) return { job: ada, bergabung: true };
+  bersihkanJob();
+  const job = {
+    id: `sync-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    site, oleh, status: 'running', mulai: Date.now(), selesai: null,
+    progress: { selesai: 0, total: src.tabs.length, tab: null },
+    hasil: [], dibuang: 0, peringatan: [], error: null,
+  };
+  const jalan = async () => {
+    try {
+      const daftarTab = await daftarTabSheet(src.sheetId);
+      job.hasil = new Array(src.tabs.length).fill(null);
+      await dalamBatas(src.tabs, SYNC_PARALEL, async (tab, i) => {
+        job.progress.tab = tab;
+        try { job.hasil[i] = await tarikSatuTab(src.sheetId, tab, site, oleh, daftarTab); }
+        catch (err) {
+          console.warn(`[weekly-sync] ${site}/${tab}:`, err.message);
+          job.hasil[i] = { tab, error: err.message };
+        }
+        job.progress.selesai++;
+      });
+      job.dibuang = await WeeklyReports.hapusTabUsang(site, src.tabs);
+      const gagal = job.hasil.filter((h) => h.error).length;
+      await WeeklyReports.markSync(site, `${gagal ? `${gagal} tab gagal` : 'OK'}${oleh === 'auto-sync' ? ' (auto)' : ''}`);
+      job.peringatan = await peringatanSiteLain(site, src.tabs);
+      job.status = 'done';
+    } catch (err) {
+      console.error(`[weekly-sync] ${site}:`, err);
+      job.status = 'error';
+      job.error = err.message || 'Sinkronisasi gagal.';
+    } finally {
+      job.selesai = Date.now();
+      syncAktif.delete(site);
+    }
+  };
+  // `promise` sengaja non-enumerable agar tidak ikut terserialisasi.
+  Object.defineProperty(job, 'promise', { value: jalan(), enumerable: false });
+  syncAktif.set(site, job);
+  daftarJob.set(job.id, job);
+  return { job, bergabung: false };
+}
 
 // ── Otorisasi: user hanya boleh menyentuh site-nya sendiri ────────────────
 function siteGuard(req, site) {
@@ -1136,23 +1237,30 @@ export function weeklyReportRouter() {
     res.json({ sheetId, tersimpan });
   }));
 
-  // Tarik ulang dari Google Sheet. Dipanggil manual maupun oleh auto-sync.
+  // Tarik ulang dari Google Sheet.
+  //  • { async: true }  → langsung 202 + jobId; klien memantau lewat GET /weekly-reports/sync/:jobId
+  //    (dipakai frontend baru — tidak ada request panjang yang bisa diputus proxy).
+  //  • tanpa async      → perilaku lama: menunggu selesai lalu mengembalikan hasil (kompatibel).
   r.post('/weekly-reports/sync', requireAuth, wrap(async (req, res) => {
     const site = req.body?.site || req.auth.assignedSite;
     siteGuard(req, site);
     const src = await WeeklyReports.source(site);
     if (!src) return res.status(400).json({ error: 'Sumber spreadsheet untuk site ini belum diatur.' });
 
-    const hasil = [];
-    const daftarTab = await daftarTabSheet(src.sheetId);
-    for (const tab of src.tabs) {
-      try { hasil.push(await tarikSatuTab(src.sheetId, tab, site, req.auth.email, daftarTab)); }
-      catch (err) { hasil.push({ tab, error: err.message }); }
-    }
-    const gagal = hasil.filter((h) => h.error).length;
-    const dibuang = await WeeklyReports.hapusTabUsang(site, src.tabs);
-    await WeeklyReports.markSync(site, gagal ? `${gagal} tab gagal` : 'OK');
-    res.json({ site, syncedAt: new Date().toISOString(), hasil, dibuang, peringatan: await peringatanSiteLain(site, src.tabs) });
+    const { job, bergabung } = mulaiSync(site, src, req.auth.email);
+    if (req.body?.async) return res.status(202).json({ jobId: job.id, status: job.status, bergabung });
+
+    await job.promise;
+    if (job.status === 'error') return res.status(502).json({ error: job.error });
+    res.json({ site, syncedAt: new Date(job.selesai).toISOString(), hasil: job.hasil, dibuang: job.dibuang, peringatan: job.peringatan });
+  }));
+
+  r.get('/weekly-reports/sync/:jobId', requireAuth, wrap(async (req, res) => {
+    const job = daftarJob.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Sesi sinkronisasi tidak ditemukan (server mungkin baru restart). Silakan klik Sync Sekarang lagi.' });
+    siteGuard(req, job.site);
+    res.set('Cache-Control', 'no-store');
+    res.json(tampilanJob(job));
   }));
 
   // Import manual: frontend mengirim CSV hasil upload .xlsx/.csv.
@@ -1187,22 +1295,28 @@ export function weeklyReportRouter() {
 }
 
 /** Auto-sync berkala untuk semua site yang mengaktifkannya. */
+let tickBerjalan = false;
 export function startAutoSync(intervalMs = 5 * 60 * 1000) {
   const tick = async () => {
+    // Satu putaran lebih lama dari interval (mis. Google lambat) tidak boleh bertumpuk dengan putaran berikutnya.
+    if (tickBerjalan) return;
+    tickBerjalan = true;
     try {
-      const { rows } = await query('SELECT site, sheet_id, tabs FROM weekly_report_sources WHERE auto_sync = TRUE');
+      const { rows } = await query('SELECT site, sheet_id, tabs, last_sync_at FROM weekly_report_sources WHERE auto_sync = TRUE ORDER BY site');
       for (const s of rows) {
         const tabsAktif = (s.tabs || '').split('|').filter(Boolean);
-        const daftarTab = await daftarTabSheet(s.sheet_id);
-        for (const tab of tabsAktif) {
-          try { await tarikSatuTab(s.sheet_id, tab, s.site, 'auto-sync', daftarTab); }
-          catch (err) { console.warn(`[weekly-sync] ${s.site}/${tab}:`, err.message); }
-        }
-        await WeeklyReports.hapusTabUsang(s.site, tabsAktif);
-        await WeeklyReports.markSync(s.site, 'OK (auto)');
+        if (!tabsAktif.length) continue;
+        if (syncAktif.has(s.site)) continue; // sedang disinkron (mis. klik manual) — jangan dobel
+        // Baru saja disinkron (manual atau putaran sebelumnya)? Lewati — tidak ada gunanya menarik ulang.
+        if (s.last_sync_at && Date.now() - new Date(s.last_sync_at).getTime() < intervalMs * 0.8) continue;
+        const { job } = mulaiSync(s.site, { sheetId: s.sheet_id, tabs: tabsAktif }, 'auto-sync');
+        await job.promise; // site satu per satu agar beban ke DB/Google tetap rendah
       }
     } catch (err) { console.error('[weekly-sync]', err.message); }
+    finally { tickBerjalan = false; }
   };
-  setTimeout(tick, 15_000);
+  // Tunda lebih lama setelah server menyala: saat bangun dari mode tidur, pengguna biasanya langsung
+  // membuka halaman — beri waktu untuk permintaan mereka sebelum pekerjaan latar belakang dimulai.
+  setTimeout(tick, 30_000);
   return setInterval(tick, intervalMs);
 }

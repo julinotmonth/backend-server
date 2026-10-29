@@ -8,6 +8,7 @@
 import express from 'express';
 import { query } from './db.js';
 import { requireAuth } from './auth.js';
+import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { parseCsv, parseTanggal } from './weeklyReport.js';
 import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
 
@@ -236,12 +237,11 @@ export function extractGid(input) {
 }
 
 async function fetchCsvByGid(sheetId, gid) {
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) {
-    throw Object.assign(new Error(`Gagal membaca sheet (HTTP ${res.status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
+  const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
+  const { ok, status, text } = await fetchGoogleText(url);
+  if (!ok) {
+    throw Object.assign(new Error(`Gagal membaca sheet (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
   }
-  const text = await res.text();
   if (text.trimStart().startsWith('<')) {
     throw Object.assign(new Error('Sheet tidak bisa diakses publik. Ubah izin berbagi sheet menjadi "Anyone with the link".'), { status: 400 });
   }
@@ -434,7 +434,10 @@ export function picaRouter() {
 /** Auto-sync berkala untuk semua site yang mengaktifkannya — dipanggil dari
  * index.js bersamaan dengan startAutoSync() milik weeklyReport.js. */
 export function startPicaAutoSync(intervalMs = 5 * 60 * 1000) {
+  let berjalan = false;
   const tick = async () => {
+    if (berjalan) return; // putaran lama belum selesai — jangan bertumpuk
+    berjalan = true;
     try {
       const { rows } = await query('SELECT site, sheet_id, gid FROM pica_sources WHERE auto_sync = TRUE');
       for (const s of rows) {
@@ -449,8 +452,11 @@ export function startPicaAutoSync(intervalMs = 5 * 60 * 1000) {
       }
     } catch (err) {
       console.error('[pica] auto-sync gagal', err);
+    } finally {
+      berjalan = false;
     }
   };
-  tick();
-  setInterval(tick, intervalMs);
+  // Jeda awal bertingkat (lihat index.js) supaya tidak semua sync menyerbu saat server baru bangun.
+  setTimeout(tick, 45000).unref();
+  setInterval(tick, intervalMs).unref();
 }

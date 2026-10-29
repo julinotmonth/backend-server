@@ -25,7 +25,16 @@ const connectionString =
   process.env.DATABASE_URL ||
   'postgres://reethau:reethau_dev_pw@localhost:5432/reethau_inventory';
 
-export const pool = new Pool({ connectionString });
+export const pool = new Pool({
+  connectionString,
+  max: Number(process.env.PG_POOL_MAX) || 10,
+  // Tanpa ini koneksi ke DB yang lambat/tidur menggantung tanpa batas dan request ikut macet.
+  connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 15_000,
+  idleTimeoutMillis: 30_000,
+  keepAlive: true,
+  // Query yang tersangkut tidak boleh menahan koneksi selamanya.
+  statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 120_000,
+});
 
 pool.on('error', (err) => {
   console.error('[db] Unexpected error on idle PostgreSQL client', err);
