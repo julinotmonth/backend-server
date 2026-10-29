@@ -592,6 +592,17 @@ export async function fetchTabCsv(sheetId, tabName, gid = null) {
   return text;
 }
 
+// Entitas pemilik transaksi (RDA / RCE / RET) dibaca dari nama tab sumber.
+// Pola KHT "Out (1)"/"In (1)" = tab kedua = RCE. Tanpa penanda → 'UMUM'.
+export function entitasDariTab(tab) {
+  const t = tab || '';
+  if (/\bRDA\b/i.test(t)) return 'RDA';
+  if (/\bRCE\b/i.test(t)) return 'RCE';
+  if (/\bRET\b/i.test(t)) return 'RET';
+  if (/\(1\)/.test(t)) return 'RCE';
+  return 'UMUM';
+}
+
 const directionOf = (tab) => {
   if (/aset/i.test(tab)) return 'ASET';
   // Beberapa site pakai penamaan Bahasa Indonesia ("Barang Masuk - RDA SETU"
@@ -966,6 +977,7 @@ export const WeeklyReports = {
         ORDER BY tahun, bulan, minggu, tanggal NULLS LAST, nama_barang`, params);
     const hasil = rows.map((r) => ({
       id: r.id, site: r.site, direction: r.direction, sourceTab: r.source_tab,
+      entitas: entitasDariTab(r.source_tab),
       tanggal: r.tanggal ? new Date(r.tanggal).toISOString().slice(0, 10) : null,
       minggu: r.minggu, bulan: r.bulan, tahun: r.tahun, kode: r.kode,
       namaBarang: r.nama_barang, jumlah: Number(r.jumlah), satuan: r.satuan,
