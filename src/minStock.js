@@ -25,6 +25,7 @@ import express from 'express';
 import { query } from './db.js';
 import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { requireAuth } from './auth.js';
+import { muatSiteScope, lokasiCocok } from './siteAccess.js';
 import { parseCsv } from './weeklyReport.js';
 import { extractSheetId, extractGid } from './workTarget.js';
 
@@ -254,6 +255,31 @@ export function parseMinStockCsv(csvText) {
   };
 }
 
+// ── Penyempitan data untuk akun yang dibatasi ke satu site ────────────────
+// Hanya baris lokasi yang cocok yang dikirim; status "filled" per minggu dihitung ulang
+// dan total seluruh perusahaan (sheetTotals) tidak ikut terkirim.
+export function sempitkanMinStock(data, scope) {
+  const groups = (data?.groups || [])
+    .map((g) => ({ ...g, rows: g.rows.filter((r) => lokasiCocok(r.location, scope)) }))
+    .filter((g) => g.rows.length);
+  if (!groups.length) return null;
+  const weeks = (data.weeks || []).map((w, i) => {
+    let sMin = 0, sReal = 0;
+    for (const g of groups) for (const row of g.rows) {
+      const e = row.v[i];
+      if (e) { sMin += e[0] ?? 0; sReal += e[1] ?? 0; }
+    }
+    return { ...w, filled: sMin > 0 && sReal > 0 };
+  });
+  if (!weeks.some((w) => w.filled)) return null;
+  const rows = groups.reduce((a, g) => a + g.rows.length, 0);
+  return {
+    title: data.title, year: data.year, target: data.target,
+    weeks, groups, sheetTotals: {},
+    meta: { rows, weeks: weeks.length, filledWeeks: weeks.filter((w) => w.filled).length },
+  };
+}
+
 // ── Ambil CSV dari Google Sheets ───────────────────────────────────────────
 async function fetchCsvByGid(sheetId, gid) {
   const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
@@ -302,7 +328,7 @@ export const MinStock = {
     return data;
   },
 
-  async payload(isSuperAdmin) {
+  async payload(isSuperAdmin, scope = null) {
     const r = await this.row();
     if (!r) return { source: null, data: null };
     const source = r.sheet_id
@@ -312,13 +338,19 @@ export const MinStock = {
         ...(isSuperAdmin ? { sheetUrl: `https://docs.google.com/spreadsheets/d/${r.sheet_id}/edit?gid=${r.gid}` } : {}),
       }
       : (r.data ? { autoSync: false, lastSyncAt: r.last_sync_at, lastStatus: r.last_status, manual: true } : null);
-    return { source, data: r.data || null, dataUpdatedAt: r.data_updated_at };
+    if (!scope) return { source, data: r.data || null, dataUpdatedAt: r.data_updated_at };
+    // Akun terbatas satu site: hanya data lokasi site-nya. data=null bila tidak ada di sheet.
+    return {
+      source, data: r.data ? sempitkanMinStock(r.data, scope) : null, dataUpdatedAt: r.data_updated_at,
+      scope: { key: scope.key, label: scope.label },
+    };
   },
 };
 
 // ── Router ────────────────────────────────────────────────────────────────
-// Company-wide: semua user yang login boleh membaca; hanya Super Admin yang
-// boleh mengubah sumber / sinkron / impor manual.
+// Semua user login boleh membaca, tetapi akun non-Super Admin yang ditugaskan ke satu site hanya
+// menerima data lokasi site-nya (lihat siteAccess.js). Hanya Super Admin yang boleh
+// mengubah sumber / sinkron / impor manual.
 export function minStockRouter() {
   const r = express.Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -329,7 +361,7 @@ export function minStockRouter() {
   };
 
   r.get('/min-stock', requireAuth, wrap(async (req, res) => {
-    res.json(await MinStock.payload(req.auth.role === 'Super Admin'));
+    res.json(await MinStock.payload(req.auth.role === 'Super Admin', await muatSiteScope(req.auth)));
   }));
 
   r.post('/min-stock/source', requireAuth, wrap(async (req, res) => {

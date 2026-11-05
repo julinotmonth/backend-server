@@ -24,6 +24,7 @@ import express from 'express';
 import { query } from './db.js';
 import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { requireAuth } from './auth.js';
+import { muatSiteScope, lokasiCocok } from './siteAccess.js';
 import { parseCsv } from './weeklyReport.js';
 import { extractSheetId, extractGid } from './workTarget.js';
 
@@ -168,6 +169,34 @@ export function parseOutstandingPrCsv(csvText) {
   };
 }
 
+// ── Penyempitan data untuk akun yang dibatasi ke satu site ────────────────
+// Hanya baris site yang cocok yang dikirim; total, catatan, dan riwayat dihitung ulang
+// supaya angka seluruh perusahaan tidak ikut terkirim ke browser.
+export function sempitkanOutstandingPr(data, scope) {
+  const sites = (data?.sites || []).filter((s) => lokasiCocok(s.label, scope));
+  if (!sites.length) return null;
+  const grand = { pending: 0, released: 0, total: 0 };
+  for (const s of sites) { grand.pending += s.totals.pending; grand.released += s.totals.released; grand.total += s.totals.total; }
+  const categories = (data.categories || []).filter((k) => sites.some((s) => s.categories.some((c) => c.name === k)));
+  const labels = sites.map((s) => s.label);
+  const notes = (data.notes || []).filter((n) => labels.some((l) => n.startsWith(`${l} ·`) || n.startsWith(`${l}:`)));
+  const history = (data.history || [])
+    .map((h) => {
+      const perSite = Object.fromEntries(Object.entries(h.perSite || {}).filter(([lab]) => lokasiCocok(lab, scope)));
+      return {
+        week: h.week, label: h.label, date: h.date,
+        total: Object.values(perSite).reduce((a, v) => a + (Number(v) || 0), 0),
+        pending: null, released: null, perSite, // pending/released per site tidak direkam di riwayat
+      };
+    })
+    .filter((h) => Object.keys(h.perSite).length > 0);
+  return {
+    title: data.title, weekFromSheet: data.weekFromSheet,
+    categories, sites, grand, sheetGrand: null, notes, history,
+    meta: { sites: sites.length, categories: categories.length, rows: sites.reduce((a, s) => a + s.categories.length, 0) },
+  };
+}
+
 // ── Riwayat mingguan ──────────────────────────────────────────────────────
 function isoWeek(d) {
   const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
@@ -238,7 +267,7 @@ export const OutstandingPr = {
     return this.saveData(parsed, 'OK');
   },
 
-  async payload(isSuperAdmin) {
+  async payload(isSuperAdmin, scope = null) {
     const r = await this.row();
     if (!r) return { source: null, data: null };
     const source = r.sheet_id
@@ -247,12 +276,18 @@ export const OutstandingPr = {
         ...(isSuperAdmin ? { sheetUrl: `https://docs.google.com/spreadsheets/d/${r.sheet_id}/edit?gid=${r.gid}` } : {}),
       }
       : (r.data ? { autoSync: false, lastSyncAt: r.last_sync_at, lastStatus: r.last_status, manual: true } : null);
-    return { source, data: r.data || null, dataUpdatedAt: r.data_updated_at };
+    if (!scope) return { source, data: r.data || null, dataUpdatedAt: r.data_updated_at };
+    // Akun terbatas satu site: hanya data site-nya. data=null bila site tidak ada di sheet.
+    return {
+      source, data: r.data ? sempitkanOutstandingPr(r.data, scope) : null, dataUpdatedAt: r.data_updated_at,
+      scope: { key: scope.key, label: scope.label },
+    };
   },
 };
 
 // ── Router ────────────────────────────────────────────────────────────────
-// Company-wide: semua user login boleh membaca; hanya Super Admin yang mengubah sumber / sinkron / impor.
+// Semua user login boleh membaca, tetapi akun non-Super Admin yang ditugaskan ke satu site hanya
+// menerima data site-nya (lihat siteAccess.js). Hanya Super Admin yang mengubah sumber / sinkron / impor.
 export function outstandingPrRouter() {
   const r = express.Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -263,7 +298,7 @@ export function outstandingPrRouter() {
   };
 
   r.get('/outstanding-pr', requireAuth, wrap(async (req, res) => {
-    res.json(await OutstandingPr.payload(req.auth.role === 'Super Admin'));
+    res.json(await OutstandingPr.payload(req.auth.role === 'Super Admin', await muatSiteScope(req.auth)));
   }));
 
   r.post('/outstanding-pr/source', requireAuth, wrap(async (req, res) => {
