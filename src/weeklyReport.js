@@ -621,16 +621,24 @@ export async function fetchTabCsv(sheetId, tabName, gid = null) {
   return text;
 }
 
-// Entitas pemilik transaksi (RDA / RCE / RET) dibaca dari nama tab sumber.
-// Pola KHT "Out (1)"/"In (1)" = tab kedua = RCE. Tanpa penanda → 'UMUM'.
+// Entitas pemilik transaksi: RDA = Mother Station, RCE = Workshop, RET.
+// Dibaca dulu dari KODE BARANG ("I-RDA-00294", "HSE-RDA-00013", "I-RCE-00267", "I-RET-0045"); bila kode tidak
+// memuat entitas (mis. kode aset "01.11-2026-0033") dipakai entitas dari NAMA TAB sumber. Garis bawah dihitung
+// pemisah, jadi tab "IN_RDA" / "IN_RCE" ikut terbaca. Pola KHT "Out (1)"/"In (1)" = tab kedua = RCE.
+// Tanpa penanda sama sekali → 'UMUM'. (Aturan yang sama dipakai halaman Laporan di frontend.)
+const POLA_ENTITAS = /(?:^|[^A-Za-z])(RDA|RCE|RET)(?![A-Za-z])/i;
+export function entitasDariKode(kode) {
+  const m = POLA_ENTITAS.exec(String(kode || ''));
+  return m ? m[1].toUpperCase() : null;
+}
 export function entitasDariTab(tab) {
   const t = tab || '';
-  if (/\bRDA\b/i.test(t)) return 'RDA';
-  if (/\bRCE\b/i.test(t)) return 'RCE';
-  if (/\bRET\b/i.test(t)) return 'RET';
+  const m = POLA_ENTITAS.exec(t);
+  if (m) return m[1].toUpperCase();
   if (/\(1\)/.test(t)) return 'RCE';
   return 'UMUM';
 }
+export const entitasBaris = (kode, tab) => entitasDariKode(kode) || entitasDariTab(tab);
 
 const directionOf = (tab) => {
   if (/aset/i.test(tab)) return 'ASET';
@@ -1009,7 +1017,7 @@ export const WeeklyReports = {
         ORDER BY tahun, bulan, minggu, tanggal NULLS LAST, nama_barang`, params);
     const hasil = rows.map((r) => ({
       id: r.id, site: r.site, direction: r.direction, sourceTab: r.source_tab,
-      entitas: entitasDariTab(r.source_tab),
+      entitas: entitasBaris(r.kode, r.source_tab),
       tanggal: r.tanggal ? new Date(r.tanggal).toISOString().slice(0, 10) : null,
       minggu: r.minggu, bulan: r.bulan, tahun: r.tahun, kode: r.kode,
       namaBarang: r.nama_barang, jumlah: Number(r.jumlah), satuan: r.satuan,
@@ -1333,7 +1341,7 @@ export function weeklyReportRouter() {
   }));
 
   // Export ke Excel dengan template yang SAMA seperti sheet sumber (lihat weeklyExport.js).
-  // Query: direction=IN|OUT (wajib), site, tahun, bulan, entitas=RDA|RCE|RET|UMUM.
+  // Query: direction=IN|OUT (wajib), site, tahun, bulan, entitas=RDA|RCE|RET|UMUM, tetap=1. Hasil diurutkan per MINGGU.
   r.get('/weekly-reports/export', requireAuth, wrap(async (req, res) => {
     const direction = String(req.query.direction || '').toUpperCase();
     if (!['IN', 'OUT'].includes(direction)) return res.status(400).json({ error: 'Arah harus IN (Barang Masuk) atau OUT (Barang Keluar).' });
@@ -1344,6 +1352,8 @@ export function weeklyReportRouter() {
     const tahun = Number(req.query.tahun) || 0;
     const bulan = Number(req.query.bulan) || 0;
     const entitas = String(req.query.entitas || '').toUpperCase();
+    // `tetap=1`: site yang otomatis satu entitas (LNG → RDA, RET → RET) — baris tanpa penanda entitas ikut terbawa.
+    const tetap = req.query.tetap === '1';
 
     const where = ['direction = $1'], params = [direction];
     const tambah = (sql, v) => { params.push(v); where.push(sql.replace('?', `$${params.length}`)); };
@@ -1354,8 +1364,11 @@ export function weeklyReportRouter() {
       `SELECT site, source_tab, urut, raw, to_char(tanggal, 'YYYY-MM-DD') AS tanggal, minggu, bulan, tahun, kode, nama_barang,
               jumlah, satuan, alokasi, detail_alokasi, pic, harga, total_harga, no_mr, no_shipment, keterangan
          FROM weekly_report_rows WHERE ${where.join(' AND ')}
-        ORDER BY site, source_tab, urut NULLS LAST, tahun, bulan, minggu, tanggal NULLS LAST, nama_barang`, params);
-    const rows = entitas ? semua.filter((x) => entitasDariTab(x.source_tab) === entitas) : semua;
+        ORDER BY site, source_tab, tahun, (minggu = 0), minggu, tanggal NULLS LAST, urut NULLS LAST, nama_barang`, params);
+    // Data disaring per ENTITAS menurut kode barang (RDA = Mother Station, RCE = Workshop), lalu sudah terurut per minggu.
+    const rows = entitas
+      ? semua.filter((x) => { const e = entitasBaris(x.kode, x.source_tab); return e === entitas || (tetap && e === 'UMUM'); })
+      : semua;
     if (!rows.length) return res.status(404).json({ error: 'Tidak ada data untuk diekspor pada filter ini.' });
 
     const { rows: lay } = await query(
@@ -1363,17 +1376,34 @@ export function weeklyReportRouter() {
       site !== 'global' ? [direction, site] : [direction]);
     const layouts = new Map(lay.map((l) => [`${l.site}|${l.source_tab}`, { header: l.header, preamble: l.preamble }]));
 
-    const { buffer, standar } = await buatXlsx({ rows, layouts, direction });
+    // Contoh penulisan tanggal tiap tab (dari SELURUH tab, bukan hanya hasil saring) — supaya tanggal yang diisi
+    // otomatis memakai gaya sheet ("29 July 2026") walau semua tanggal pada hasil saring kebetulan kosong.
+    const contohTanggal = new Map();
+    for (const k of new Set(rows.map((x) => `${x.site}|${x.source_tab}`))) {
+      const lay1 = layouts.get(k);
+      const idx = lay1 ? lay1.header.findIndex((h) => norm(h) === 'tanggal') : -1;
+      if (idx < 0) continue;
+      const [siteTab, ...sisa] = k.split('|');
+      const { rows: c } = await query(
+        `SELECT raw ->> $4::int AS t FROM weekly_report_rows
+          WHERE site = $1 AND direction = $2 AND source_tab = $3 AND raw IS NOT NULL AND trim(coalesce(raw ->> $4::int, '')) <> ''
+          LIMIT 5`, [siteTab, direction, sisa.join('|'), idx]);
+      contohTanggal.set(k, c.map((x) => x.t));
+    }
+
+    const { buffer, standar, tanggalTerisi } = await buatXlsx({ rows, layouts, direction, contohTanggal });
     const periode = bulan ? NAMA_BULAN_UPPER[bulan - 1] : (tahun || 'SEMUA');
-    const nama = `REPORT_${direction === 'OUT' ? 'KELUAR' : 'MASUK'}${entitas ? `_${entitas}` : ''}_${periode}_MS_${site === 'global' ? 'SEMUA_SITE' : site}`
+    const labelEntitas = { RDA: 'MOTHER_STATION', RCE: 'WORKSHOP', RET: 'RET', UMUM: 'UMUM' }[entitas] || entitas;
+    const nama = `REPORT_${direction === 'OUT' ? 'KELUAR' : 'MASUK'}${entitas && !tetap ? `_${labelEntitas}` : ''}_${periode}_MS_${site === 'global' ? 'SEMUA_SITE' : site}`
       .toUpperCase().replace(/[^A-Z0-9._-]+/g, '_') + '.xlsx';
     res.set({
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'Content-Disposition': `attachment; filename="${nama}"`,
       'Cache-Control': 'no-store',
       // Dibaca frontend (lintas origin): nama file + jumlah tab yang memakai kolom standar (belum disinkronkan ulang).
-      'Access-Control-Expose-Headers': 'Content-Disposition, X-Export-Fallback',
+      'Access-Control-Expose-Headers': 'Content-Disposition, X-Export-Fallback, X-Export-Tanggal-Terisi',
       'X-Export-Fallback': String(standar),
+      'X-Export-Tanggal-Terisi': String(tanggalTerisi), // tanggal kosong di sheet yang diisi dari nomor minggu (ditandai kuning)
     });
     res.send(buffer);
   }));
