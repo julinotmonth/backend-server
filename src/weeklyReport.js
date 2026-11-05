@@ -11,6 +11,7 @@ import { query, withTransaction } from './db.js';
 import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { requireAuth } from './auth.js';
 import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
+import { buatXlsx } from './weeklyExport.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────
 export const WEEKLY_REPORT_SCHEMA = `
@@ -57,6 +58,22 @@ CREATE INDEX IF NOT EXISTS idx_wrr_minggu ON weekly_report_rows(site, minggu);
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS jenis TEXT NOT NULL DEFAULT '';
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS merk  TEXT NOT NULL DEFAULT '';
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS tipe  TEXT NOT NULL DEFAULT '';
+
+-- Template asli sheet sumber, dipakai Export supaya kolom & isinya sama persis dengan sheet:
+--   raw  = isi sel asli satu baris (apa adanya) · urut = posisi baris pada tab sumber
+--   weekly_report_layouts = baris judul + baris header asli tiap tab sumber
+-- Terisi pada sync/import berikutnya (baris lama tetap bisa diekspor dengan kolom standar).
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS raw  JSONB;
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS urut INTEGER;
+CREATE TABLE IF NOT EXISTS weekly_report_layouts (
+  site        TEXT NOT NULL,
+  direction   TEXT NOT NULL,
+  source_tab  TEXT NOT NULL,
+  header      JSONB NOT NULL,
+  preamble    JSONB NOT NULL DEFAULT '[]'::jsonb,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (site, direction, source_tab)
+);
 
 -- Konfigurasi sumber sheet per site (dipakai tombol Sync & auto-sync).
 CREATE TABLE IF NOT EXISTS weekly_report_sources (
@@ -305,7 +322,7 @@ export function rowsToRecords(rows, site) {
   let subBabBerjalan = '';
   const out = [];
 
-  for (const r of rows.slice(headIdx + 1)) {
+  for (const [posisi, r] of rows.slice(headIdx + 1).entries()) {
     const o = {};
     cols.forEach((key, i) => { if (key) o[key] = r[i] ?? ''; });
 
@@ -354,11 +371,23 @@ export function rowsToRecords(rows, site) {
       jenis: String(o.jenis || '').trim(),
       merk: String(o.merk || '').trim(),
       tipe: String(o.tipe || '').trim(),
+      // Isi sel ASLI baris ini (sejajar dengan header sheet) + posisinya — untuk Export berformat template sheet.
+      raw: cols.map((_, c) => String(r[c] ?? '')),
+      urut: headIdx + 1 + posisi,
     };
     rec.section = classifySection(rec, site);
     out.push(rec);
   }
   return out;
+}
+
+/** Baris judul di atas header + baris header ASLI sebuah tab (untuk Export berformat template). Null bila header tak ditemukan. */
+export function layoutDariRows(rows) {
+  const headIdx = rows.findIndex((r) => r.some((c) => ['nama barang', 'nama aset', 'nama item'].includes(norm(c))));
+  if (headIdx < 0) return null;
+  const lebar = rows[headIdx].length;
+  const potong = (r) => Array.from({ length: lebar }, (_, i) => String(r[i] ?? ''));
+  return { header: potong(rows[headIdx]), preamble: rows.slice(0, headIdx).map(potong) };
 }
 
 /** Kunci dedup — import ulang sheet yang sama tidak menggandakan baris.
@@ -785,6 +814,7 @@ export async function tarikSatuTab(sheetId, tab, site, importedBy, daftarTab) {
   const arah = tentukanArah(tab, parsed);
   const records = rowsToRecords(parsed, site);
   const stat = await WeeklyReports.upsertMany(site, tab, records, importedBy, arah);
+  await WeeklyReports.simpanLayout(site, arah, tab, layoutDariRows(parsed));
   return { tab, arah, ...stat };
 }
 
@@ -847,14 +877,15 @@ const KOLOM_HASH = [
   { lama: 'no_mr', baru: 'noMr', label: 'No. MR' },
   { lama: 'total_harga', baru: 'totalHarga', label: 'Total harga', tipe: 'angka' },
 ];
+const NAMA_BULAN_UPPER = ['JANUARI', 'FEBRUARI', 'MARET', 'APRIL', 'MEI', 'JUNI', 'JULI', 'AGUSTUS', 'SEPTEMBER', 'OKTOBER', 'NOVEMBER', 'DESEMBER'];
 const ketJumlah = (jumlah, satuan) => `${Number(jumlah) || ''} ${satuan || ''}`.trim();
 
 // ── Insert massal ─────────────────────────────────────────────────────────
-// 29 kolom × 250 baris = 7.250 parameter per query (batas PostgreSQL 65.535).
+// 31 kolom × 250 baris = 7.750 parameter per query (batas PostgreSQL 65.535).
 const BATCH_UPSERT = 250;
 const KOLOM_INSERT = ['id', 'site', 'direction', 'source_tab', 'row_hash', 'tanggal', 'minggu', 'bulan', 'tahun', 'kode',
   'nama_barang', 'jumlah', 'satuan', 'alokasi', 'detail_alokasi', 'pic', 'rh', 'harga', 'total_harga',
-  'no_mr', 'gen_bus', 'status_smr', 'no_shipment', 'keterangan', 'jenis', 'merk', 'tipe', 'section', 'imported_by'];
+  'no_mr', 'gen_bus', 'status_smr', 'no_shipment', 'keterangan', 'jenis', 'merk', 'tipe', 'section', 'raw', 'urut', 'imported_by'];
 // Kolom yang di-refresh saat baris sudah ada (SEMUA kolom data, bukan sebagian — lihat catatan lama:
 // kolom yang tidak disebut di sini macet selamanya di nilai sync pertama).
 const KOLOM_REFRESH = KOLOM_INSERT.filter((k) => !['id', 'site', 'direction', 'row_hash', 'imported_by'].includes(k));
@@ -905,7 +936,8 @@ export const WeeklyReports = {
             `wr-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`, site, direction, tab, hashes[mulai + i],
             r.tanggal, r.minggu, r.bulan, r.tahun, r.kode, r.namaBarang, r.jumlah, r.satuan, r.alokasi,
             r.detailAlokasi, r.pic, r.rh, r.harga, r.totalHarga, r.noMr, r.genBus, r.statusSmr,
-            r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section, importedBy);
+            r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section,
+            r.raw ? JSON.stringify(r.raw) : null, r.urut ?? null, importedBy);
         });
         const { rows } = await db.query(sqlUpsertBatch(potong.length), params);
         for (const x of rows) { if (x.is_new) inserted++; else updated++; }
@@ -1009,6 +1041,16 @@ export const WeeklyReports = {
     return this.source(site);
   },
 
+  /** Simpan baris judul + header asli sebuah tab (dipakai Export berformat template). */
+  async simpanLayout(site, direction, tab, layout) {
+    if (!layout?.header?.length) return;
+    await query(
+      `INSERT INTO weekly_report_layouts (site, direction, source_tab, header, preamble)
+       VALUES ($1,$2,$3,$4::jsonb,$5::jsonb)
+       ON CONFLICT (site, direction, source_tab) DO UPDATE SET header=EXCLUDED.header, preamble=EXCLUDED.preamble, updated_at=NOW()`,
+      [site, direction, tab, JSON.stringify(layout.header), JSON.stringify(layout.preamble || [])]);
+  },
+
   async markSync(site, status) {
     await query('UPDATE weekly_report_sources SET last_sync_at = NOW(), last_status = $2 WHERE site = $1', [site, status]);
   },
@@ -1034,6 +1076,7 @@ export const WeeklyReports = {
       `DELETE FROM weekly_report_rows WHERE site = $1 AND NOT (source_tab = ANY($2::text[]))`,
       [site, tabsAktif]
     );
+    await query(`DELETE FROM weekly_report_layouts WHERE site = $1 AND NOT (source_tab = ANY($2::text[]))`, [site, tabsAktif]);
     return rowCount;
   },
 
@@ -1280,9 +1323,59 @@ export function weeklyReportRouter() {
     const { site, tab, csv } = req.body || {};
     siteGuard(req, site);
     if (!site || !csv) return res.status(400).json({ error: 'Site dan isi file wajib diisi.' });
-    const records = rowsToRecords(parseCsv(csv), site);
+    const barisCsv = parseCsv(csv);
+    const records = rowsToRecords(barisCsv, site);
     if (!records.length) return res.status(400).json({ error: 'Tidak ada baris valid — pastikan ada kolom "Nama Barang".' });
-    res.json(await WeeklyReports.upsertMany(site, tab || 'UPLOAD', records, req.auth.email));
+    const namaTab = tab || 'UPLOAD';
+    const hasil = await WeeklyReports.upsertMany(site, namaTab, records, req.auth.email);
+    await WeeklyReports.simpanLayout(site, directionOf(namaTab), namaTab, layoutDariRows(barisCsv));
+    res.json(hasil);
+  }));
+
+  // Export ke Excel dengan template yang SAMA seperti sheet sumber (lihat weeklyExport.js).
+  // Query: direction=IN|OUT (wajib), site, tahun, bulan, entitas=RDA|RCE|RET|UMUM.
+  r.get('/weekly-reports/export', requireAuth, wrap(async (req, res) => {
+    const direction = String(req.query.direction || '').toUpperCase();
+    if (!['IN', 'OUT'].includes(direction)) return res.status(400).json({ error: 'Arah harus IN (Barang Masuk) atau OUT (Barang Keluar).' });
+    siteGuard(req, req.query.site);
+    const mine = req.auth.assignedSite;
+    const terkunci = !(req.auth.role === 'Super Admin' || mine === 'global' || !mine);
+    const site = req.query.site || (terkunci ? mine : 'global');
+    const tahun = Number(req.query.tahun) || 0;
+    const bulan = Number(req.query.bulan) || 0;
+    const entitas = String(req.query.entitas || '').toUpperCase();
+
+    const where = ['direction = $1'], params = [direction];
+    const tambah = (sql, v) => { params.push(v); where.push(sql.replace('?', `$${params.length}`)); };
+    if (site !== 'global') tambah('site = ?', site);
+    if (tahun) tambah('tahun = ?', tahun);
+    if (bulan) tambah('bulan = ?', bulan);
+    const { rows: semua } = await query(
+      `SELECT site, source_tab, urut, raw, to_char(tanggal, 'YYYY-MM-DD') AS tanggal, minggu, bulan, tahun, kode, nama_barang,
+              jumlah, satuan, alokasi, detail_alokasi, pic, harga, total_harga, no_mr, no_shipment, keterangan
+         FROM weekly_report_rows WHERE ${where.join(' AND ')}
+        ORDER BY site, source_tab, urut NULLS LAST, tahun, bulan, minggu, tanggal NULLS LAST, nama_barang`, params);
+    const rows = entitas ? semua.filter((x) => entitasDariTab(x.source_tab) === entitas) : semua;
+    if (!rows.length) return res.status(404).json({ error: 'Tidak ada data untuk diekspor pada filter ini.' });
+
+    const { rows: lay } = await query(
+      `SELECT site, source_tab, header, preamble FROM weekly_report_layouts WHERE direction = $1${site !== 'global' ? ' AND site = $2' : ''}`,
+      site !== 'global' ? [direction, site] : [direction]);
+    const layouts = new Map(lay.map((l) => [`${l.site}|${l.source_tab}`, { header: l.header, preamble: l.preamble }]));
+
+    const { buffer, standar } = await buatXlsx({ rows, layouts, direction });
+    const periode = bulan ? NAMA_BULAN_UPPER[bulan - 1] : (tahun || 'SEMUA');
+    const nama = `REPORT_${direction === 'OUT' ? 'KELUAR' : 'MASUK'}${entitas ? `_${entitas}` : ''}_${periode}_MS_${site === 'global' ? 'SEMUA_SITE' : site}`
+      .toUpperCase().replace(/[^A-Z0-9._-]+/g, '_') + '.xlsx';
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="${nama}"`,
+      'Cache-Control': 'no-store',
+      // Dibaca frontend (lintas origin): nama file + jumlah tab yang memakai kolom standar (belum disinkronkan ulang).
+      'Access-Control-Expose-Headers': 'Content-Disposition, X-Export-Fallback',
+      'X-Export-Fallback': String(standar),
+    });
+    res.send(buffer);
   }));
 
   // Volume sales order (m3) per minggu, untuk baris Rp/m3.
