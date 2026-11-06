@@ -12,6 +12,7 @@ import { SHEETS_BASE, fetchGoogleText } from './googleFetch.js';
 import { requireAuth } from './auth.js';
 import { catatPerubahan, bandingkan, pasangkan } from './changeLog.js';
 import { buatXlsx } from './weeklyExport.js';
+import { buatInputManual } from './weeklyInput.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────
 export const WEEKLY_REPORT_SCHEMA = `
@@ -65,6 +66,18 @@ ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS tipe  TEXT NOT NULL DEFA
 -- Terisi pada sync/import berikutnya (baris lama tetap bisa diekspor dengan kolom standar).
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS raw  JSONB;
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS urut INTEGER;
+
+-- Input manual lewat website (weeklyInput.js): baris yang berasal dari form, dan status pengirimannya ke Google Sheet.
+--   sheet_status: 'ok' (sudah di sheet) | 'pending' (menunggu dikirim) | 'gagal' (Google menolak — lihat sheet_error)
+--   sheet_row   : nomor baris di tab sumber · input_nilai: isian form (dipakai kirim ulang) · dibuat_oleh: nama penginput
+-- Baris web yang belum 'ok' tidak ikut terhapus oleh sync sheet→website.
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS input_web    BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS sheet_status TEXT    NOT NULL DEFAULT 'ok';
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS sheet_row    INTEGER;
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS sheet_error  TEXT    NOT NULL DEFAULT '';
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS input_nilai  JSONB;
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS dibuat_oleh  TEXT    NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_wr_rows_belum_kirim ON weekly_report_rows (site, direction) WHERE input_web AND sheet_status <> 'ok';
 CREATE TABLE IF NOT EXISTS weekly_report_layouts (
   site        TEXT NOT NULL,
   direction   TEXT NOT NULL,
@@ -929,10 +942,15 @@ export const WeeklyReports = {
       // Isi lama (sebelum ditimpa) — dasar untuk mendeteksi perubahan nyata.
       const { rows: lamaRows } = await db.query(
         `SELECT row_hash, tanggal, kode, nama_barang, jumlah, satuan, alokasi, detail_alokasi, pic, harga,
-                total_harga, no_mr, status_smr, no_shipment, keterangan, jenis, merk, tipe
+                total_harga, no_mr, status_smr, no_shipment, keterangan, jenis, merk, tipe, input_web, sheet_status, imported_at
            FROM weekly_report_rows WHERE site = $1 AND direction = $2 AND source_tab = $3`,
         [site, direction, tab]);
       const lama = new Map(lamaRows.map((x) => [x.row_hash, x]));
+      // Baris yang diinput lewat website tapi belum terbaca dari sheet (belum terkirim, atau baru dikirim dan CSV
+      // Google belum memuatnya) tidak boleh dihapus / dianggap "hilang" oleh sync ini.
+      const terlindungi = new Set(lamaRows
+        .filter((x) => x.input_web && (x.sheet_status !== 'ok' || Date.now() - new Date(x.imported_at).getTime() < 10 * 60 * 1000))
+        .map((x) => x.row_hash));
       const barisBaru = [], ubahDiTempat = [];
       let inserted = 0, updated = 0;
 
@@ -965,24 +983,29 @@ export const WeeklyReports = {
       // kosong sementara) — kalau tidak, semua baris lama malah ikut terhapus.
       let removed = 0;
       if (hashes.length > 0) {
+        // Baris web yang ternyata sudah ada di sheet → tandai sudah tersinkron.
+        await db.query(
+          `UPDATE weekly_report_rows SET sheet_status = 'ok', sheet_error = '', sheet_row = urut
+            WHERE site = $1 AND direction = $2 AND source_tab = $3 AND input_web AND sheet_status <> 'ok' AND row_hash = ANY($4::text[])`,
+          [site, direction, tab, hashes]);
         const res = await db.query(
           `DELETE FROM weekly_report_rows
             WHERE site = $1 AND direction = $2 AND source_tab = $3
-              AND NOT (row_hash = ANY($4::text[]))`,
-          [site, direction, tab, hashes]);
+              AND NOT (row_hash = ANY($4::text[])) AND NOT (row_hash = ANY($5::text[]))`,
+          [site, direction, tab, hashes, [...terlindungi]]);
         removed = res.rowCount;
       }
-      return { inserted, updated, removed, lama, barisBaru, ubahDiTempat };
+      return { inserted, updated, removed, lama, barisBaru, ubahDiTempat, terlindungi };
     });
 
     // Log perubahan untuk notifikasi (setelah commit). Sinkron pertama (tab masih kosong) hanya
     // baseline — tidak dicatat, supaya ratusan baris awal tidak membanjiri notifikasi.
     // Gagal mencatat notifikasi tidak boleh menggagalkan sync yang datanya sudah tersimpan.
-    const { lama, barisBaru, ubahDiTempat } = hasil;
+    const { lama, barisBaru, ubahDiTempat, terlindungi } = hasil;
     if (lama.size > 0) {
       try {
         const batch = new Set(hashes);
-        const hilang = hashes.length > 0 ? [...lama].filter(([h]) => !batch.has(h)).map(([, v]) => v) : [];
+        const hilang = hashes.length > 0 ? [...lama].filter(([h]) => !batch.has(h) && !terlindungi.has(h)).map(([, v]) => v) : [];
         const kunciRec = (b) => [b.tanggal || '', normKode(b.kode), normNama(b.namaBarang)].join('|');
         const kunciDb = (l) => [l.tanggal ? String(l.tanggal).slice(0, 10) : '', normKode(l.kode), normNama(l.nama_barang)].join('|');
         const { baru, ubah, hapus } = pasangkan(barisBaru, hilang, kunciRec, kunciDb);
@@ -1340,6 +1363,9 @@ export function weeklyReportRouter() {
     res.json(hasil);
   }));
 
+  // Input manual Barang Masuk/Keluar lewat website (form dari template sheet, tulis ke Google Sheet) — lihat weeklyInput.js.
+  r.use(inputManualInstance().router);
+
   // Export ke Excel dengan template yang SAMA seperti sheet sumber (lihat weeklyExport.js).
   // Query: direction=IN|OUT (wajib), site, tahun, bulan, entitas=RDA|RCE|RET|UMUM, tetap=1. Hasil diurutkan per MINGGU.
   r.get('/weekly-reports/export', requireAuth, wrap(async (req, res) => {
@@ -1431,12 +1457,19 @@ export function weeklyReportRouter() {
 
 /** Auto-sync berkala untuk semua site yang mengaktifkannya. */
 let tickBerjalan = false;
+let inputManual = null;
+const inputManualInstance = () => (inputManual ||= buatInputManual({
+  query, withTransaction, requireAuth, siteGuard, rowsToRecords, HEADER_MAP, norm, hashRow, entitasDariTab, entitasDariKode, catatPerubahan,
+}));
+
 export function startAutoSync(intervalMs = 5 * 60 * 1000) {
   const tick = async () => {
     // Satu putaran lebih lama dari interval (mis. Google lambat) tidak boleh bertumpuk dengan putaran berikutnya.
     if (tickBerjalan) return;
     tickBerjalan = true;
     try {
+      // Kirim ulang input website yang belum masuk ke Google Sheet (mis. Google sempat bermasalah).
+      try { await inputManualInstance().kirimTertunda(); } catch (err) { console.warn('[input-manual] kirim ulang:', err.message); }
       const { rows } = await query('SELECT site, sheet_id, tabs, last_sync_at FROM weekly_report_sources WHERE auto_sync = TRUE ORDER BY site');
       for (const s of rows) {
         const tabsAktif = (s.tabs || '').split('|').filter(Boolean);
