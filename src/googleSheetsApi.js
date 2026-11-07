@@ -227,3 +227,138 @@ export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKo
     return { baris: baru, sudahAda: false, kolomRumus };
   });
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// UBAH & HAPUS baris yang sudah ada (CRUD lewat website)
+//
+// Nomor baris di DB bisa usang (orang lain menyisipkan/menghapus baris di sheet), jadi baris TIDAK dicari
+// berdasarkan nomor saja: seluruh blok data dibaca sekali, lalu dicari baris yang isinya cocok dengan
+// baris yang dilihat pengguna (callback `cocok`). Bila ada beberapa baris kembar, dipilih yang paling dekat
+// dengan `petunjuk` (nomor baris terakhir yang diketahui). Tidak ketemu → galat 409 (jangan menimpa baris orang lain).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/** Validasi tab + header (struktur sheet belum berubah) → konteks kerja untuk ubah/hapus. */
+async function siapkanKerja(sheetId, tab, header) {
+  const info = await infoTab(sheetId, tab);
+  const q = kutip(info.judul);
+  const nCol = header.length;
+  const kolAkhir = huruf(nCol - 1);
+  const atas = await nilai(sheetId, `${q}!A1:${kolAkhir}25`);
+  const idxHeader = atas.findIndex((r) => (r || []).some((c) => normH(c) === 'nama barang'));
+  if (idxHeader < 0) throw galat('Baris header ("Nama Barang") tidak ditemukan di sheet. Klik "Sync Sekarang" lalu coba lagi.', 409);
+  const beda = header.findIndex((h, i) => !blank(h) && normH(h) !== normH(atas[idxHeader]?.[i]));
+  if (beda >= 0) throw galat(`Kolom sheet sudah berubah (kolom ${huruf(beda)}: "${header[beda]}" → "${atas[idxHeader]?.[beda] ?? ''}"). Klik "Sync Sekarang" supaya form mengikuti template terbaru.`, 409);
+  return { info, q, nCol, kolAkhir, barisHeader: idxHeader + 1 };
+}
+
+// `cocok` boleh berupa satu fungsi atau daftar fungsi berurutan dari yang paling ketat ke paling longgar:
+// tingkat pertama yang menemukan kandidat dipakai (pencocokan ketat dulu, longgar hanya bila ketat gagal).
+async function cariBarisSheet(sheetId, ctx, { cocok, petunjuk }) {
+  const blok = await nilai(sheetId, `${ctx.q}!A${ctx.barisHeader + 1}:${ctx.kolAkhir}`);
+  for (const f of (Array.isArray(cocok) ? cocok : [cocok])) {
+    const kandidat = [];
+    blok.forEach((r, i) => { if (f(r || [])) kandidat.push(ctx.barisHeader + 1 + i); });
+    if (!kandidat.length) continue;
+    if (petunjuk) kandidat.sort((a, b) => Math.abs(a - petunjuk) - Math.abs(b - petunjuk));
+    return kandidat[0];
+  }
+  return null;
+}
+
+const TIDAK_KETEMU = 'Baris ini tidak ditemukan lagi di sheet (kemungkinan sudah diubah atau dihapus langsung di sheet). Klik "Sync Sekarang", lalu coba lagi.';
+
+/**
+ * Menimpa satu baris. Hanya kolom milik form (`kolomKelola`) yang ditulis — kolom lain (mis. catatan tanpa header) dan
+ * kolom RUMUS dibiarkan apa adanya.
+ * @param kolomKelola Set indeks kolom yang boleh ditimpa
+ * @param cocok       (barisTerformat: string[]) => boolean — pengenal baris lama
+ * @param petunjuk    nomor baris terakhir yang diketahui (opsional)
+ * @returns { baris }
+ */
+export function ubahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKolom, kolomKelola, cocok, petunjuk }) {
+  return serial(`${sheetId}|${tab}`, async () => {
+    const ctx = await siapkanKerja(sheetId, tab, header);
+    const { q, nCol, kolAkhir } = ctx;
+    const baris = await cariBarisSheet(sheetId, ctx, { cocok, petunjuk });
+    if (!baris) throw galat(TIDAK_KETEMU, 409);
+
+    const r = `${q}!A${baris}:${kolAkhir}${baris}`;
+    const rumus = (await nilai(sheetId, r, 'FORMULA'))[0] || [];
+    const mentah = (await nilai(sheetId, r, 'UNFORMATTED_VALUE'))[0] || [];
+    const kolomRumus = Array.from({ length: nCol }, (_, i) => typeof rumus[i] === 'string' && rumus[i].startsWith('='));
+    const tanggalSerial = idxTanggal >= 0 && typeof mentah[idxTanggal] === 'number';
+
+    const sel = Array.from({ length: nCol }, (_, i) => {
+      if (!kolomKelola.has(i) || kolomRumus[i]) return null;
+      const v = nilaiKolom[i];
+      if (i === idxTanggal && v && typeof v === 'object') return tanggalSerial ? serialDariIso(v.iso) : v.teks;
+      return v === undefined || v === null ? '' : v;
+    });
+    const data = [];
+    for (let i = 0; i < nCol;) {
+      if (sel[i] === null) { i++; continue; }
+      let j = i; while (j + 1 < nCol && sel[j + 1] !== null) j++;
+      data.push({ range: `${q}!${huruf(i)}${baris}:${huruf(j)}${baris}`, values: [sel.slice(i, j + 1)] });
+      i = j + 1;
+    }
+    if (data.length) await sheetsApi(`/v4/spreadsheets/${encodeURIComponent(sheetId)}/values:batchUpdate`, { method: 'POST', body: { valueInputOption: 'RAW', data } });
+
+    const cek = (await nilai(sheetId, r))[0] || [];
+    if (normH(cek[idxNama]) !== normH(String(nilaiKolom[idxNama] ?? ''))) {
+      throw galat(`Baris ${baris} sheet tidak cocok setelah ditulis (kemungkinan ada yang mengedit bersamaan). Periksa sheet, lalu coba lagi.`, 409);
+    }
+    cacheRumus.delete(`${sheetId}|${tab}|${nCol}`);
+    return { baris };
+  });
+}
+
+/**
+ * Menghapus satu baris dari sheet (seperti klik kanan → Hapus baris: baris di bawahnya naik, rumus menyesuaikan).
+ * Bila baris sudah tidak ada di sheet → { sudahTiada: true } (tujuannya tercapai, jadi bukan galat).
+ */
+export function hapusBaris({ sheetId, tab, header, cocok, petunjuk }) {
+  return serial(`${sheetId}|${tab}`, async () => {
+    const ctx = await siapkanKerja(sheetId, tab, header);
+    const baris = await cariBarisSheet(sheetId, ctx, { cocok, petunjuk });
+    if (!baris) return { baris: null, sudahTiada: true };
+    if (baris <= ctx.barisHeader) throw galat('Baris header tidak boleh dihapus.', 409);
+    await sheetsApi(`/v4/spreadsheets/${encodeURIComponent(sheetId)}:batchUpdate`, {
+      method: 'POST',
+      body: { requests: [{ deleteDimension: { range: { sheetId: ctx.info.gid, dimension: 'ROWS', startIndex: baris - 1, endIndex: baris } } }] },
+    });
+    cacheRumus.delete(`${sheetId}|${tab}|${ctx.nCol}`);
+    return { baris, sudahTiada: false };
+  });
+}
+
+/**
+ * Pemeriksaan koneksi bertahap (untuk panduan "Sambungkan Google Sheet" di website). Tidak pernah melempar galat:
+ * setiap tahap berisi { ok, error }. Tahap berikutnya hanya diperiksa bila tahap sebelumnya lolos.
+ */
+export async function diagnosaSheet({ sheetId, tabs = [] }) {
+  const h = {
+    kredensial: { ok: sheetsTersambung(), email: emailAkunLayanan(), error: '' },
+    token: { ok: false, error: '' },
+    sheet: { ok: false, error: '', judul: '', status: 0 },
+    tabs: [],
+    tulis: { ok: false, error: '' },
+  };
+  if (!h.kredensial.ok) { h.kredensial.error = 'Variabel GOOGLE_SERVICE_ACCOUNT_B64 belum diisi (atau isinya bukan JSON kunci akun layanan yang valid).'; return h; }
+  try { await ambilToken(); h.token.ok = true; } catch (e) { h.token.error = e.message; return h; }
+  if (!sheetId) { h.sheet.error = 'Sumber Sheet untuk site ini belum diatur (tombol "Sumber Sheet" di halaman Laporan).'; return h; }
+  let daftar = [];
+  try {
+    const j = await sheetsApi(`/v4/spreadsheets/${encodeURIComponent(sheetId)}`, { query: { fields: 'properties.title,sheets.properties(sheetId,title)' } });
+    h.sheet.ok = true; h.sheet.judul = j.properties?.title || '';
+    daftar = (j.sheets || []).map((s) => s.properties);
+  } catch (e) { h.sheet.error = e.message; h.sheet.status = e.status || 0; return h; }
+  h.tabs = tabs.map((t) => ({ nama: t, ada: daftar.some((p) => p.title === t || normH(p.title) === normH(t)) }));
+  try {
+    // Uji izin Editor tanpa mengubah isi: menyimpan ulang judul spreadsheet dengan judul yang sama.
+    await sheetsApi(`/v4/spreadsheets/${encodeURIComponent(sheetId)}:batchUpdate`, {
+      method: 'POST', body: { requests: [{ updateSpreadsheetProperties: { properties: { title: h.sheet.judul }, fields: 'title' } }] },
+    });
+    h.tulis.ok = true;
+  } catch (e) { h.tulis.error = e.message; }
+  return h;
+}

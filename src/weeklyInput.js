@@ -9,7 +9,7 @@
 //      (atau manual lewat tombol "Kirim ulang"). Sync sheet→website tidak menghapus baris yang belum terkirim.
 // Arah sebaliknya (sheet → website) tetap lewat sinkron biasa; baris yang sama dikenali lewat hash yang sama.
 import express from 'express';
-import { tambahBaris, deteksiKolomRumus, sheetsTersambung, emailAkunLayanan } from './googleSheetsApi.js';
+import { tambahBaris, ubahBaris, hapusBaris, diagnosaSheet, deteksiKolomRumus, sheetsTersambung, emailAkunLayanan } from './googleSheetsApi.js';
 import { deteksiFormatTanggal, formatTanggal, angkaKetat } from './weeklyExport.js';
 
 const FIELD_ANGKA = new Set(['jumlah', 'harga', 'totalHarga', 'rh']);
@@ -96,7 +96,7 @@ export function buatInputManual(d) {
 
   // ── Validasi → baris yang siap ditulis ───────────────────────────────────────
   /** nilai: { [indeksKolom]: nilai mentah dari form }. Kembalikan { cells, nilaiKolom, ringkas } atau lempar galat per-field. */
-  async function siapkanBaris({ site, direction, tab, header, kolom, nilai, abaikan }) {
+  async function siapkanBaris({ site, direction, tab, header, kolom, nilai, abaikan, tanggalAsli = '' }) {
     const galatField = {};
     const ambil = (field) => { const k = kolom.find((x) => x.field === field); return k ? { k, v: nilai?.[k.idx] } : { k: null, v: undefined }; };
     const saran = await ambilSaran(site, direction);
@@ -108,7 +108,7 @@ export function buatInputManual(d) {
       iso = String(tg.v ?? '').trim();
       if (!tanggalValid(iso)) galatField[tg.k.idx] = 'Tanggal tidak valid.';
       else if (iso > geser(hariIni(), 1)) galatField[tg.k.idx] = 'Tanggal tidak boleh di masa depan.';
-      else if (iso < geser(hariIni(), -730)) galatField[tg.k.idx] = 'Tanggal lebih dari 2 tahun lalu — periksa kembali.';
+      else if (iso < geser(hariIni(), -730) && iso !== tanggalAsli) galatField[tg.k.idx] = 'Tanggal lebih dari 2 tahun lalu — periksa kembali.';
     }
     const nomor = (field, { min = 0, maks = 1e9, wajib = false, label }) => {
       const { k, v } = ambil(field);
@@ -226,6 +226,15 @@ export function buatInputManual(d) {
     }
   }
 
+  /** Rekam untuk DB lewat jalur parser yang sama dengan sync → hash identik dengan baris yang nanti dibaca dari sheet. */
+  function susunRekaman({ site, header, kolom, baris }) {
+    const sel = baris.sel.map((v, i) => (kolom.find((k) => k.idx === i)?.field === 'tanggal' ? baris.iso : v));
+    const rec = rowsToRecords([header, sel], site)[0];
+    if (!rec) throw galat('Baris tidak bisa dibaca dengan template tab ini.', 422);
+    rec.raw = baris.sel;
+    return { rec, basis: hashRow(rec) };
+  }
+
   // ── Simpan ────────────────────────────────────────────────────────────────
   async function simpanInput({ site, direction, tab, nilai, abaikan, auth }) {
     const header = await ambilLayout(site, direction, tab);
@@ -233,12 +242,7 @@ export function buatInputManual(d) {
     if (!kolom.some((k) => k.field === 'namaBarang')) throw galat('Template tab ini tidak punya kolom "Nama Barang".', 409);
     const baris = await siapkanBaris({ site, direction, tab, header, kolom, nilai, abaikan });
 
-    // Rekam untuk DB lewat jalur parser yang sama dengan sync → hash identik dengan baris yang nanti dibaca dari sheet.
-    const sel = baris.sel.map((v, i) => (kolom.find((k) => k.idx === i)?.field === 'tanggal' ? baris.iso : v));
-    const rec = rowsToRecords([header, sel], site)[0];
-    if (!rec) throw galat('Baris tidak bisa dibaca dengan template tab ini.', 422);
-    rec.raw = baris.sel;
-    const basis = hashRow(rec);
+    const { rec, basis } = susunRekaman({ site, header, kolom, baris });
 
     const id = await withTransaction(async (db) => {
       await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`wr:${site}:${direction}:${tab}`]);
@@ -360,6 +364,317 @@ export function buatInputManual(d) {
       id: x.id, tab: x.source_tab, tanggal: x.tanggal || null, kode: x.kode, nama: x.nama_barang,
       jumlah: Number(x.jumlah), satuan: x.satuan, status: x.sheet_status, barisSheet: x.sheet_row, error: x.sheet_error, oleh: x.dibuat_oleh, waktu: x.imported_at,
     })) });
+  }));
+
+  // ═════════════════════════════════════════════════════════════════════════════════════════
+  // CRUD lewat website: daftar data, ubah, hapus (satu / massal), uji koneksi, kirim data tertunda.
+  //
+  // Aturan inti — sheet adalah sumber kebenaran (sync sheet→website menimpa isi aplikasi):
+  //   • Baris yang SUDAH ada di Google Sheet diubah/dihapus di sheet LEBIH DULU, baru di aplikasi.
+  //     Butuh koneksi akun layanan; bila tidak tersambung, permintaan ditolak dengan pesan jelas
+  //     (kalau hanya aplikasi yang diubah, sync berikutnya akan membatalkannya).
+  //   • Baris input web yang BELUM masuk sheet (status pending/gagal) cukup diubah/dihapus di aplikasi.
+  //   • Baris di sheet dicari lewat ISI-nya (bukan nomor baris saja), jadi tetap benar walau orang lain
+  //     menyisipkan/menghapus baris di sheet. Tidak ketemu → ditolak, tidak pernah menimpa baris orang lain.
+  // ═════════════════════════════════════════════════════════════════════════════════════════
+  const KOLOM_DB = {
+    kode: 'kode', namaBarang: 'nama_barang', satuan: 'satuan', alokasi: 'alokasi', detailAlokasi: 'detail_alokasi', pic: 'pic', rh: 'rh',
+    harga: 'harga', totalHarga: 'total_harga', noMr: 'no_mr', genBus: 'gen_bus', statusSmr: 'status_smr', noShipment: 'no_shipment',
+    keterangan: 'keterangan', jumlah: 'jumlah',
+  };
+  const tglDb = (t) => (t ? String(t).slice(0, 10) : '');
+  const bacaJml = (s) => { const a = angkaKetat(s, 'ID') ?? angkaKetat(s, 'US'); return a ? a.n : Number(String(s ?? '').replace(',', '.')); };
+  const samaAngka = (a, b) => {
+    const x = typeof a === 'number' ? a : bacaJml(a), y = typeof b === 'number' ? b : bacaJml(b);
+    return Number.isFinite(x) && Number.isFinite(y) ? Math.abs(x - y) < 1e-6 : normKunci(a) === normKunci(b);
+  };
+  const barisWebTertunda = (r) => !!r.input_web && r.sheet_status !== 'ok'; // belum pernah masuk sheet → cukup diubah di aplikasi
+
+  /** Isian form ({indeksKolom: nilai}) dari baris DB — dipakai mengisi form edit/duplikat dan tombol "Urungkan". */
+  function nilaiDariBaris(row, kolom) {
+    const raw = Array.isArray(row.raw) ? row.raw : null;
+    const out = {};
+    for (const k of kolom) {
+      if (k.auto || k.rumus) continue;
+      const sel = raw ? String(raw[k.idx] ?? '').trim() : null;
+      if (k.field === 'tanggal') out[k.idx] = tglDb(row.tanggal);
+      else if (k.jenis === 'angka') {
+        const n = Number(row[KOLOM_DB[k.field]]);
+        out[k.idx] = sel === '' ? '' : Number.isFinite(n) && (sel !== null || n !== 0) ? n : '';
+      } else {
+        let v = raw ? String(raw[k.idx] ?? '') : (k.field && KOLOM_DB[k.field] ? String(row[KOLOM_DB[k.field]] ?? '') : '');
+        if (!raw && k.field === 'alokasi' && v === 'OTHERS') v = '';
+        out[k.idx] = v;
+      }
+    }
+    return out;
+  }
+
+  /** Pengenal baris di sheet, dari yang paling ketat (semua sel terisi sama) ke yang longgar (nama + kode + jumlah). */
+  function tingkatCocok(row, kolom) {
+    const idx = (f) => kolom.find((k) => k.field === f)?.idx ?? -1;
+    const iNama = idx('namaBarang'), iKode = idx('kode'), iJml = idx('jumlah');
+    const raw = Array.isArray(row.raw) ? row.raw : null;
+    const asli = (i, kolDb) => (i < 0 ? '' : raw ? String(raw[i] ?? '') : String(row[kolDb] ?? ''));
+    const nama = asli(iNama, 'nama_barang'), kode = asli(iKode, 'kode');
+    const jml = iJml < 0 ? null : raw ? raw[iJml] : Number(row.jumlah);
+    const longgar = (r) => normKunci(r[iNama]) === normKunci(nama)
+      && (iKode < 0 || normKunci(r[iKode]) === normKunci(kode))
+      && (iJml < 0 || samaAngka(r[iJml] ?? '', jml ?? ''));
+    const ketat = raw ? (r) => longgar(r) && raw.every((v, i) => kosong(v) || normKunci(r[i]) === normKunci(v)) : longgar;
+    return [ketat, longgar];
+  }
+  const petunjukBaris = (row) => row.sheet_row || (row.urut ? row.urut + 1 : undefined);
+
+  async function muatBaris(id, auth) {
+    const { rows } = await query(`SELECT * FROM weekly_report_rows WHERE id = $1 AND direction IN ('IN','OUT')`, [id]);
+    if (!rows.length) throw galat('Data tidak ditemukan (mungkin sudah dihapus).', 404);
+    siteGuard({ auth }, rows[0].site);
+    return rows[0];
+  }
+  /** Prasyarat menulis ke sheet untuk baris yang sudah ada di sheet; melempar galat yang menjelaskan apa yang kurang. */
+  async function siapkanSheet(row, apa) {
+    if (!sheetsTersambung()) {
+      throw galat(`Baris ini sudah ada di Google Sheet, jadi ${apa} harus ikut ditulis ke sheet. Google Sheet belum tersambung — buka panduan “Sambungkan Google Sheet” (admin: pasang akun layanan Google dan bagikan sheet sebagai Editor).`, 412, { konflik: 'belum-tersambung' });
+    }
+    const sheetId = await sheetIdSite(row.site);
+    if (!sheetId) throw galat('Sumber Sheet untuk site ini belum diatur.', 409);
+    return sheetId;
+  }
+
+  const PERBANDINGAN_LOG = [
+    ['Tanggal', (r) => tglDb(r.tanggal), (c) => c.tanggal || ''], ['Kode', (r) => r.kode, (c) => c.kode], ['Nama barang', (r) => r.nama_barang, (c) => c.namaBarang],
+    ['Jumlah', (r) => Number(r.jumlah), (c) => Number(c.jumlah), true], ['Satuan', (r) => r.satuan, (c) => c.satuan], ['Alokasi/Supplier', (r) => r.alokasi, (c) => c.alokasi],
+    ['Harga', (r) => Number(r.harga), (c) => Number(c.harga), true], ['PIC', (r) => r.pic, (c) => c.pic], ['Keterangan', (r) => r.keterangan, (c) => c.keterangan], ['No. MR', (r) => r.no_mr, (c) => c.noMr],
+  ];
+  function perubahanUntukLog(lama, rec) {
+    const hasil = [];
+    for (const [kolom, a, b, angka] of PERBANDINGAN_LOG) {
+      const x = a(lama), y = b(rec);
+      const sama = angka ? Number(x || 0) === Number(y || 0) : String(x ?? '').trim() === String(y ?? '').trim();
+      if (!sama) hasil.push({ kolom, dari: String(x ?? '').trim() || '(kosong)', ke: String(y ?? '').trim() || '(kosong)' });
+    }
+    return hasil;
+  }
+
+  // ── UBAH ─────────────────────────────────────────────────────────────────
+  async function ubahInput({ id, nilai, abaikan, auth }) {
+    const row = await muatBaris(id, auth);
+    const { site, direction, source_tab: tab } = row;
+    const diSheet = !barisWebTertunda(row);
+    // Cek koneksi paling awal: tidak ada gunanya pengguna membereskan isian bila perubahan pasti ditolak.
+    const sheetId = diSheet ? await siapkanSheet(row, 'perubahannya') : null;
+    const header = await ambilLayout(site, direction, tab);
+    const kolom = kolomDariHeader(header, direction);
+    if (!kolom.some((k) => k.field === 'namaBarang')) throw galat('Template tab ini tidak punya kolom "Nama Barang".', 409);
+    const baris = await siapkanBaris({ site, direction, tab, header, kolom, nilai, abaikan, tanggalAsli: tglDb(row.tanggal) });
+    const { rec, basis } = susunRekaman({ site, header, kolom, baris });
+    const idxKelola = new Set(kolom.map((k) => k.idx));
+    rec.raw = baris.sel.map((v, i) => (idxKelola.has(i) ? v : String(row.raw?.[i] ?? ''))); // kolom di luar form tetap seperti semula
+
+    // Hash hanya berubah bila kolom pembentuk hash (tanggal/kode/nama/jumlah/alokasi/no MR/total) berubah.
+    const basisLama = String(row.row_hash).replace(/\|#\d+$/, '');
+    const hashBerubah = basis !== basisLama;
+    if (hashBerubah && !abaikan.includes('duplikat')) {
+      const { rows: sama } = await query(
+        `SELECT 1 FROM weekly_report_rows WHERE site = $1 AND direction = $2 AND id <> $3 AND (row_hash = $4 OR starts_with(row_hash, $4 || '|#')) LIMIT 1`, [site, direction, id, basis]);
+      if (sama.length) throw galat('Setelah diubah, data ini sama persis (tanggal, kode, jumlah, alokasi, dan nomor dokumen) dengan baris lain yang sudah tercatat. Pastikan ini bukan input ganda.', 409, { konflik: 'duplikat' });
+    }
+
+    // 1) Tulis ke sheet LEBIH DULU (bila barisnya sudah ada di sheet) — gagal di sini = aplikasi belum berubah.
+    let barisSheet = row.sheet_row;
+    if (diSheet) {
+      const h = await ubahBaris({
+        sheetId, tab, header, idxNama: kolom.find((k) => k.field === 'namaBarang').idx, idxTanggal: kolom.find((k) => k.field === 'tanggal')?.idx ?? -1,
+        nilaiKolom: baris.nilaiKolom, kolomKelola: idxKelola, cocok: tingkatCocok(row, kolom), petunjuk: petunjukBaris(row),
+      });
+      barisSheet = h.baris;
+    }
+
+    // 2) Simpan di aplikasi. Ditandai input_web + imported_at terbaru supaya sync yang sedang berjalan (membaca CSV lama)
+    //    tidak menghapus baris ini; sync berikutnya menyamakan semuanya.
+    await withTransaction(async (db) => {
+      await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`wr:${site}:${direction}:${tab}`]);
+      let hash = row.row_hash;
+      if (hashBerubah) {
+        const { rows: lain } = await db.query(
+          `SELECT row_hash FROM weekly_report_rows WHERE site = $1 AND direction = $2 AND id <> $3 AND (row_hash = $4 OR starts_with(row_hash, $4 || '|#'))`, [site, direction, id, basis]);
+        const terpakai = new Set(lain.map((x) => x.row_hash));
+        hash = basis;
+        for (let n = 2; terpakai.has(hash); n++) hash = `${basis}|#${n}`;
+      }
+      await db.query(
+        `UPDATE weekly_report_rows SET row_hash=$2, tanggal=$3, minggu=$4, bulan=$5, tahun=$6, kode=$7, nama_barang=$8, jumlah=$9, satuan=$10, alokasi=$11,
+           detail_alokasi=$12, pic=$13, rh=$14, harga=$15, total_harga=$16, no_mr=$17, gen_bus=$18, status_smr=$19, no_shipment=$20, keterangan=$21,
+           jenis=$22, merk=$23, tipe=$24, section=$25, raw=$26::jsonb, input_nilai=$27::jsonb, input_web=TRUE,
+           sheet_status = CASE WHEN $28 THEN 'ok' ELSE 'pending' END, sheet_error='', sheet_row=$29,
+           imported_at=NOW(), imported_by=$30, diubah_oleh=$31, diubah_pada=NOW()
+         WHERE id=$1`,
+        [id, hash, rec.tanggal, rec.minggu, rec.bulan, rec.tahun, rec.kode, rec.namaBarang, rec.jumlah, rec.satuan, rec.alokasi,
+          rec.detailAlokasi, rec.pic, rec.rh, rec.harga, rec.totalHarga, rec.noMr, rec.genBus, rec.statusSmr, rec.noShipment, rec.keterangan,
+          rec.jenis, rec.merk, rec.tipe, rec.section, JSON.stringify(rec.raw), JSON.stringify(baris.nilaiTersimpan),
+          diSheet, barisSheet ?? null, `web:${auth.email}`, auth.name || auth.email]);
+    });
+
+    const perubahan = perubahanUntukLog(row, rec);
+    if (perubahan.length) {
+      try {
+        await catatPerubahan({ site, area: direction, sumber: `web:${auth.email}`, baru: [], hapus: [],
+          ubah: [{ pic: rec.pic || auth.name || auth.email, nama: rec.namaBarang, ket: `${rec.jumlah} ${rec.satuan}`.trim(), perubahan }] });
+      } catch (e) { console.warn('[input-manual] gagal mencatat notifikasi ubah:', e.message); }
+    }
+    return {
+      ok: true, id, status: diSheet ? 'ok' : row.sheet_status === 'gagal' ? 'pending' : row.sheet_status, barisSheet: barisSheet ?? null, berubah: perubahan.length,
+      pesan: diSheet ? `Perubahan tersimpan di sheet "${tab}" baris ${barisSheet} dan di aplikasi.` : 'Perubahan tersimpan di aplikasi (barisnya belum masuk ke sheet, jadi yang dikirim nanti sudah versi terbaru).',
+    };
+  }
+
+  // ── HAPUS ────────────────────────────────────────────────────────────────
+  async function hapusInput({ id, auth }) {
+    const row = await muatBaris(id, auth);
+    const { site, direction, source_tab: tab } = row;
+    const diSheet = !barisWebTertunda(row);
+    const sheetId = diSheet ? await siapkanSheet(row, 'penghapusannya') : null;
+    let kolom = null, header = null;
+    try { header = await ambilLayout(site, direction, tab); kolom = kolomDariHeader(header, direction); } catch { /* baris pending tidak butuh template */ }
+    const snapshot = kolom ? nilaiDariBaris(row, kolom) : null; // untuk "Urungkan"
+
+    let dariSheet = null;
+    if (diSheet) {
+      if (!kolom) throw galat(`Tab "${tab}" belum pernah disinkronkan, jadi template kolomnya belum diketahui. Klik "Sync Sekarang" dulu.`, 409);
+      dariSheet = await hapusBaris({ sheetId, tab, header, cocok: tingkatCocok(row, kolom), petunjuk: petunjukBaris(row) });
+    }
+    await withTransaction(async (db) => {
+      await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`wr:${site}:${direction}:${tab}`]);
+      await db.query('DELETE FROM weekly_report_rows WHERE id = $1', [id]);
+    });
+    try {
+      await catatPerubahan({ site, area: direction, sumber: `web:${auth.email}`, baru: [], ubah: [],
+        hapus: [{ pic: row.pic || auth.name || auth.email, nama: row.nama_barang, ket: `${Number(row.jumlah)} ${row.satuan}`.trim() }] });
+    } catch (e) { console.warn('[input-manual] gagal mencatat notifikasi hapus:', e.message); }
+    const dihapusDiSheet = !!dariSheet && !dariSheet.sudahTiada;
+    return {
+      ok: true, id, tab, nilai: snapshot, dihapusDiSheet,
+      pesan: dihapusDiSheet ? `Dihapus dari sheet "${tab}" (baris ${dariSheet.baris}) dan dari aplikasi.`
+        : dariSheet ? 'Baris sudah tidak ada di sheet; dihapus dari aplikasi.' : 'Dihapus dari aplikasi (barisnya belum sempat masuk ke sheet).',
+    };
+  }
+
+  const bungkusGalat = (res, err) => {
+    if (err.status && err.status < 500) return res.status(err.status).json({ error: err.message, konflik: err.konflik, galatField: err.galatField });
+    throw err;
+  };
+
+  // Daftar data (tabel kelola): cari, saring, urutkan, halaman.
+  router.get('/weekly-reports/input/data', requireAuth, wrap(async (req, res) => {
+    const { site, direction } = parseSiteArah(req);
+    const tab = String(req.query.tab || '');
+    const qs = String(req.query.q || '').trim().slice(0, 80);
+    const status = String(req.query.status || 'semua');
+    const tgl = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : '');
+    const dari = tgl(req.query.dari), sampai = tgl(req.query.sampai);
+    const kunciUrut = { tanggal: 'tanggal', nama: 'nama_barang', jumlah: 'jumlah', waktu: 'imported_at' }[String(req.query.urut)] || 'tanggal';
+    const sortir = String(req.query.sortir) === 'asc' ? 'ASC' : 'DESC';
+    const batas = Math.min(100, Math.max(5, Number(req.query.batas) || 25));
+    const halaman = Math.max(1, Number(req.query.halaman) || 1);
+
+    const p = [site, direction], where = ['site = $1', 'direction = $2'];
+    const tambah = (sql, v) => { p.push(v); where.push(sql.replace('?', `$${p.length}`)); };
+    if (tab) tambah('source_tab = ?', tab);
+    if (dari) tambah('tanggal >= ?::date', dari);
+    if (sampai) tambah('tanggal <= ?::date', sampai);
+    if (status === 'ok') where.push(`sheet_status = 'ok'`);
+    else if (status === 'tertunda') where.push(`sheet_status <> 'ok'`);
+    else if (status === 'web') where.push('input_web');
+    if (qs) {
+      p.push(`%${qs.replace(/[\\%_]/g, '\\$&')}%`);
+      const n = p.length;
+      where.push(`(nama_barang ILIKE $${n} OR kode ILIKE $${n} OR alokasi ILIKE $${n} OR pic ILIKE $${n} OR keterangan ILIKE $${n} OR no_mr ILIKE $${n} OR detail_alokasi ILIKE $${n})`);
+    }
+    const W = where.join(' AND ');
+    const { rows: [{ n: total }] } = await query(`SELECT COUNT(*)::int AS n FROM weekly_report_rows WHERE ${W}`, p);
+    const { rows } = await query(
+      `SELECT * FROM weekly_report_rows WHERE ${W} ORDER BY ${kunciUrut} ${sortir} NULLS LAST, urut DESC NULLS LAST, id LIMIT ${batas} OFFSET ${(halaman - 1) * batas}`, p);
+
+    const { rows: lay } = await query('SELECT source_tab, header FROM weekly_report_layouts WHERE site = $1 AND direction = $2', [site, direction]);
+    const kolomTab = new Map(lay.map((l) => [l.source_tab, kolomDariHeader(l.header, direction)]));
+    const { rows: perTab } = await query(`SELECT source_tab, COUNT(*)::int AS n FROM weekly_report_rows WHERE site = $1 AND direction = $2 GROUP BY source_tab ORDER BY source_tab`, [site, direction]);
+    const { rows: [ringkas] } = await query(
+      `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE sheet_status <> 'ok')::int AS tertunda FROM weekly_report_rows WHERE site = $1 AND direction = $2`, [site, direction]);
+    const sheetId = await sheetIdSite(site);
+    const tersambung = sheetsTersambung() && !!sheetId;
+
+    res.json({
+      total, halaman, batas, tersambung, emailLayanan: emailAkunLayanan(), sheetDiatur: !!sheetId, ringkas,
+      tabs: perTab.map((t) => ({ tab: t.source_tab, entitas: entitasDariTab(t.source_tab), jumlah: t.n })),
+      baris: rows.map((r) => {
+        const kolom = kolomTab.get(r.source_tab);
+        let alasanTerkunci = '';
+        if (!kolom || !kolom.some((k) => k.field === 'namaBarang')) alasanTerkunci = 'Template tab ini belum tersinkron — klik "Sync Sekarang" di halaman Laporan.';
+        else if (!barisWebTertunda(r) && !tersambung) alasanTerkunci = 'Baris ini sudah ada di Google Sheet. Sambungkan Google Sheet dulu supaya perubahan ikut tertulis ke sheet.';
+        return {
+          id: r.id, tab: r.source_tab, entitas: entitasDariTab(r.source_tab), tanggal: tglDb(r.tanggal) || null, kode: r.kode, nama: r.nama_barang,
+          jumlah: Number(r.jumlah), satuan: r.satuan, alokasi: r.alokasi === 'OTHERS' ? '' : r.alokasi, harga: Number(r.harga), totalHarga: Number(r.total_harga),
+          pic: r.pic, keterangan: r.keterangan, noMr: r.no_mr, status: r.sheet_status, barisSheet: r.sheet_row, error: r.sheet_error,
+          dariWeb: !!r.input_web, oleh: r.dibuat_oleh || '', diubahOleh: r.diubah_oleh || '', diubahPada: r.diubah_pada, waktu: r.imported_at,
+          nilai: kolom && !alasanTerkunci ? nilaiDariBaris(r, kolom) : null, alasanTerkunci,
+        };
+      }),
+    });
+  }));
+
+  router.patch('/weekly-reports/input/:id', requireAuth, wrap(async (req, res) => {
+    const abaikan = Array.isArray(req.body?.abaikan) ? req.body.abaikan.map(String) : [];
+    try { res.json(await ubahInput({ id: req.params.id, nilai: req.body?.nilai || {}, abaikan, auth: req.auth })); }
+    catch (err) { bungkusGalat(res, err); }
+  }));
+
+  router.delete('/weekly-reports/input/:id', requireAuth, wrap(async (req, res) => {
+    try { res.json(await hapusInput({ id: req.params.id, auth: req.auth })); }
+    catch (err) { bungkusGalat(res, err); }
+  }));
+
+  router.post('/weekly-reports/input/hapus-massal', requireAuth, wrap(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.map(String))] : [];
+    if (!ids.length) return res.status(400).json({ error: 'Pilih minimal satu baris.' });
+    if (ids.length > 30) return res.status(400).json({ error: 'Maksimal 30 baris sekali hapus.' });
+    const hasil = [];
+    for (const id of ids) { // berurutan: penghapusan baris menggeser baris di bawahnya di sheet
+      try { hasil.push(await hapusInput({ id, auth: req.auth })); }
+      catch (err) {
+        if (!(err.status && err.status < 500) && err.status !== 502) throw err;
+        hasil.push({ ok: false, id, pesan: err.message });
+        if (err.konflik === 'belum-tersambung') break; // sisanya pasti gagal dengan alasan yang sama
+      }
+    }
+    res.json({ hasil, berhasil: hasil.filter((h) => h.ok).length, gagal: ids.length - hasil.filter((h) => h.ok).length });
+  }));
+
+  // Uji koneksi bertahap untuk panduan "Sambungkan Google Sheet".
+  router.get('/weekly-reports/input/diagnosa', requireAuth, wrap(async (req, res) => {
+    const site = String(req.query.site || '').trim();
+    if (!site || site === 'global') throw galat('Pilih satu site terlebih dulu.', 400);
+    siteGuard(req, site);
+    const { rows } = await query('SELECT sheet_id, tabs FROM weekly_report_sources WHERE site = $1', [site]);
+    const sumber = rows[0];
+    const hasil = await diagnosaSheet({ sheetId: sumber?.sheet_id || null, tabs: sumber?.tabs ? sumber.tabs.split('|').filter(Boolean) : [] });
+    const { rows: [t] } = await query(`SELECT COUNT(*)::int AS n FROM weekly_report_rows WHERE site = $1 AND input_web AND sheet_status <> 'ok'`, [site]);
+    res.json({ ...hasil, sheetDiatur: !!sumber, tertunda: t.n, linkSheet: sumber ? `https://docs.google.com/spreadsheets/d/${sumber.sheet_id}/edit` : null });
+  }));
+
+  // Kirim sekarang semua input web yang belum masuk sheet (setelah koneksi diaktifkan).
+  router.post('/weekly-reports/input/kirim-tertunda', requireAuth, wrap(async (req, res) => {
+    const site = String(req.body?.site || '').trim();
+    if (!site || site === 'global') throw galat('Pilih satu site terlebih dulu.', 400);
+    siteGuard(req, site);
+    if (!sheetsTersambung()) throw galat('Akun layanan Google belum dipasang di server.', 412, { konflik: 'belum-tersambung' });
+    const { rows } = await query(`SELECT * FROM weekly_report_rows WHERE site = $1 AND input_web AND sheet_status <> 'ok' ORDER BY imported_at LIMIT 100`, [site]);
+    let terkirim = 0, pesanGagal = '';
+    for (const b of rows) {
+      const h = await cobaKirim(b, { idempoten: true });
+      if (h.status === 'ok') terkirim++; else if (!pesanGagal) pesanGagal = h.pesan;
+    }
+    res.json({ total: rows.length, terkirim, gagal: rows.length - terkirim, pesanGagal });
   }));
 
   return { router, kirimTertunda };

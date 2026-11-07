@@ -76,6 +76,10 @@ ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS sheet_status TEXT    NOT
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS sheet_row    INTEGER;
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS sheet_error  TEXT    NOT NULL DEFAULT '';
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS input_nilai  JSONB;
+
+-- Ubah lewat website (weeklyInput.js, PATCH /weekly-reports/input/:id): siapa & kapan terakhir mengubah baris.
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS diubah_oleh TEXT;
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS diubah_pada TIMESTAMPTZ;
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS dibuat_oleh  TEXT    NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_wr_rows_belum_kirim ON weekly_report_rows (site, direction) WHERE input_web AND sheet_status <> 'ok';
 CREATE TABLE IF NOT EXISTS weekly_report_layouts (
