@@ -84,6 +84,9 @@ async function sheetsApi(jalur, { method = 'GET', query, body } = {}, percobaan 
   const dari = j?.error?.message || `status ${res.status}`;
   if (res.status === 403) throw galat(`Akses ditolak Google. Bagikan spreadsheet ini ke ${emailAkunLayanan()} sebagai "Editor". (${dari})`, 403);
   if (res.status === 404) throw galat('Spreadsheet atau tab tidak ditemukan. Periksa link Sumber Sheet dan pastikan sudah dibagikan ke akun layanan.', 404);
+  if (res.status === 400 && /not supported for this document/i.test(dari)) {
+    throw galat('Spreadsheet ini masih berformat Excel (.xlsx) sehingga tidak bisa ditulis lewat API. Buka di Google Sheets lalu pilih File → Simpan sebagai Google Spreadsheet, kemudian atur ulang Sumber Sheet dengan link yang baru dan bagikan ke akun layanan.', 400);
+  }
   throw galat(`Google Sheets: ${dari}`, res.status === 400 ? 400 : 502);
 }
 
