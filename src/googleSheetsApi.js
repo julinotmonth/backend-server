@@ -150,7 +150,9 @@ export async function deteksiKolomRumus({ sheetId, tab, nCol, idxNama }) {
  * @param samaDengan (barisTerformat: string[]) => boolean — pengenal baris yang sama persis (agar kirim ulang tidak menggandakan)
  * @returns { baris, sudahAda, kolomRumus }
  */
-export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKolom, samaDengan }) {
+// `sepadan(headerLama, headerSheet)` (opsional): true bila dua judul beda tulisan tetapi kolom yang sama (mis. "Status S/MR" → "Status"),
+// supaya perubahan kosmetik judul tidak memblokir penulisan.
+export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKolom, samaDengan, sepadan }) {
   return serial(`${sheetId}|${tab}`, async () => {
     const info = await infoTab(sheetId, tab);
     const q = kutip(info.judul);
@@ -162,7 +164,7 @@ export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKo
     const idxHeader = atas.findIndex((r) => (r || []).some((c) => normH(c) === 'nama barang'));
     if (idxHeader < 0) throw galat('Baris header ("Nama Barang") tidak ditemukan di sheet. Klik "Sync Sekarang" lalu coba lagi.', 409);
     const barisHeader = idxHeader + 1;
-    const beda = header.findIndex((h, i) => !blank(h) && normH(h) !== normH(atas[idxHeader]?.[i]));
+    const beda = header.findIndex((h, i) => !blank(h) && normH(h) !== normH(atas[idxHeader]?.[i]) && !(sepadan && sepadan(h, atas[idxHeader]?.[i])));
     if (beda >= 0) throw galat(`Kolom sheet sudah berubah (kolom ${huruf(beda)}: "${header[beda]}" → "${atas[idxHeader]?.[beda] ?? ''}"). Klik "Sync Sekarang" supaya form mengikuti template terbaru.`, 409);
 
     // 2) Baris data terakhir = baris terakhir yang kolom "Nama Barang"-nya terisi.
@@ -238,7 +240,7 @@ export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKo
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 
 /** Validasi tab + header (struktur sheet belum berubah) → konteks kerja untuk ubah/hapus. */
-async function siapkanKerja(sheetId, tab, header) {
+async function siapkanKerja(sheetId, tab, header, sepadan) {
   const info = await infoTab(sheetId, tab);
   const q = kutip(info.judul);
   const nCol = header.length;
@@ -246,7 +248,7 @@ async function siapkanKerja(sheetId, tab, header) {
   const atas = await nilai(sheetId, `${q}!A1:${kolAkhir}25`);
   const idxHeader = atas.findIndex((r) => (r || []).some((c) => normH(c) === 'nama barang'));
   if (idxHeader < 0) throw galat('Baris header ("Nama Barang") tidak ditemukan di sheet. Klik "Sync Sekarang" lalu coba lagi.', 409);
-  const beda = header.findIndex((h, i) => !blank(h) && normH(h) !== normH(atas[idxHeader]?.[i]));
+  const beda = header.findIndex((h, i) => !blank(h) && normH(h) !== normH(atas[idxHeader]?.[i]) && !(sepadan && sepadan(h, atas[idxHeader]?.[i])));
   if (beda >= 0) throw galat(`Kolom sheet sudah berubah (kolom ${huruf(beda)}: "${header[beda]}" → "${atas[idxHeader]?.[beda] ?? ''}"). Klik "Sync Sekarang" supaya form mengikuti template terbaru.`, 409);
   return { info, q, nCol, kolAkhir, barisHeader: idxHeader + 1 };
 }
@@ -275,9 +277,9 @@ const TIDAK_KETEMU = 'Baris ini tidak ditemukan lagi di sheet (kemungkinan sudah
  * @param petunjuk    nomor baris terakhir yang diketahui (opsional)
  * @returns { baris }
  */
-export function ubahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKolom, kolomKelola, cocok, petunjuk }) {
+export function ubahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKolom, kolomKelola, cocok, petunjuk, sepadan }) {
   return serial(`${sheetId}|${tab}`, async () => {
-    const ctx = await siapkanKerja(sheetId, tab, header);
+    const ctx = await siapkanKerja(sheetId, tab, header, sepadan);
     const { q, nCol, kolAkhir } = ctx;
     const baris = await cariBarisSheet(sheetId, ctx, { cocok, petunjuk });
     if (!baris) throw galat(TIDAK_KETEMU, 409);
@@ -316,9 +318,9 @@ export function ubahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKolo
  * Menghapus satu baris dari sheet (seperti klik kanan → Hapus baris: baris di bawahnya naik, rumus menyesuaikan).
  * Bila baris sudah tidak ada di sheet → { sudahTiada: true } (tujuannya tercapai, jadi bukan galat).
  */
-export function hapusBaris({ sheetId, tab, header, cocok, petunjuk }) {
+export function hapusBaris({ sheetId, tab, header, cocok, petunjuk, sepadan }) {
   return serial(`${sheetId}|${tab}`, async () => {
-    const ctx = await siapkanKerja(sheetId, tab, header);
+    const ctx = await siapkanKerja(sheetId, tab, header, sepadan);
     const baris = await cariBarisSheet(sheetId, ctx, { cocok, petunjuk });
     if (!baris) return { baris: null, sudahTiada: true };
     if (baris <= ctx.barisHeader) throw galat('Baris header tidak boleh dihapus.', 409);

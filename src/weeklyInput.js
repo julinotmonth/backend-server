@@ -208,7 +208,7 @@ export function buatInputManual(d) {
       normKunci(r[idxNama]) === normKunci(nilaiKolom[idxNama]) &&
       (idxKode < 0 || normKunci(r[idxKode]) === normKunci(nilaiKolom[idxKode])) &&
       (idxJml < 0 || bacaJml(r[idxJml]) === Number(nilaiKolom[idxJml]))) : undefined;
-    return tambahBaris({ sheetId, tab: baris.source_tab, header, idxNama, idxTanggal: idxTgl, nilaiKolom, samaDengan });
+    return tambahBaris({ sheetId, tab: baris.source_tab, header, idxNama, idxTanggal: idxTgl, nilaiKolom, samaDengan, sepadan: sepadanHeader(baris.direction) });
   }
 
   async function cobaKirim(baris, { idempoten }) {
@@ -382,6 +382,11 @@ export function buatInputManual(d) {
     harga: 'harga', totalHarga: 'total_harga', noMr: 'no_mr', genBus: 'gen_bus', statusSmr: 'status_smr', noShipment: 'no_shipment',
     keterangan: 'keterangan', jumlah: 'jumlah',
   };
+  /** Dua judul kolom dianggap sama bila dipetakan ke field yang sama (mis. "Status S/MR" vs "Status"). */
+  const sepadanHeader = (direction) => (a, b) => {
+    const f = (x) => kolomDariHeader([x], direction)[0]?.field;
+    return !!f(a) && f(a) === f(b);
+  };
   const tglDb = (t) => (t ? String(t).slice(0, 10) : '');
   const bacaJml = (s) => { const a = angkaKetat(s, 'ID') ?? angkaKetat(s, 'US'); return a ? a.n : Number(String(s ?? '').replace(',', '.')); };
   const samaAngka = (a, b) => {
@@ -486,7 +491,7 @@ export function buatInputManual(d) {
     if (diSheet) {
       const h = await ubahBaris({
         sheetId, tab, header, idxNama: kolom.find((k) => k.field === 'namaBarang').idx, idxTanggal: kolom.find((k) => k.field === 'tanggal')?.idx ?? -1,
-        nilaiKolom: baris.nilaiKolom, kolomKelola: idxKelola, cocok: tingkatCocok(row, kolom), petunjuk: petunjukBaris(row),
+        nilaiKolom: baris.nilaiKolom, kolomKelola: idxKelola, cocok: tingkatCocok(row, kolom), petunjuk: petunjukBaris(row), sepadan: sepadanHeader(direction),
       });
       barisSheet = h.baris;
     }
@@ -542,7 +547,7 @@ export function buatInputManual(d) {
     let dariSheet = null;
     if (diSheet) {
       if (!kolom) throw galat(`Tab "${tab}" belum pernah disinkronkan, jadi template kolomnya belum diketahui. Klik "Sync Sekarang" dulu.`, 409);
-      dariSheet = await hapusBaris({ sheetId, tab, header, cocok: tingkatCocok(row, kolom), petunjuk: petunjukBaris(row) });
+      dariSheet = await hapusBaris({ sheetId, tab, header, cocok: tingkatCocok(row, kolom), petunjuk: petunjukBaris(row), sepadan: sepadanHeader(direction) });
     }
     await withTransaction(async (db) => {
       await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`wr:${site}:${direction}:${tab}`]);
