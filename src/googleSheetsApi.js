@@ -181,23 +181,26 @@ export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKo
       if (i >= 0) return { baris: dari + i, sudahAda: true, kolomRumus: [] };
     }
 
-    // 4) Pelajari baris terakhir: kolom mana yang rumus, dan apakah Tanggal berupa tanggal sungguhan.
+    // 4) Pilih baris CONTOH (sumber format) lalu pelajari: kolom mana yang rumus, dan apakah Tanggal berupa tanggal sungguhan.
+    //    Contoh = baris terbaru yang tidak diwarnai/di-highlight dan berformat angka/rupiah — bukan sekadar baris terakhir
+    //    (baris terakhir sering sedang diberi warna kuning atau belum berformat rupiah).
+    const contoh = terakhir > barisHeader ? await pilihBarisContoh(sheetId, { q, kolAkhir, barisHeader }, terakhir) : terakhir;
     let kolomRumus = Array(nCol).fill(false), tanggalSerial = false;
     if (terakhir > barisHeader) {
-      const r = `${q}!A${terakhir}:${kolAkhir}${terakhir}`;
+      const r = `${q}!A${contoh}:${kolAkhir}${contoh}`;
       const rumus = (await nilai(sheetId, r, 'FORMULA'))[0] || [];
       const mentah = (await nilai(sheetId, r, 'UNFORMATTED_VALUE'))[0] || [];
       kolomRumus = Array.from({ length: nCol }, (_, i) => typeof rumus[i] === 'string' && rumus[i].startsWith('='));
       tanggalSerial = idxTanggal >= 0 && typeof mentah[idxTanggal] === 'number';
     }
 
-    // 5) Siapkan baris baru: tambah baris grid bila perlu, salin format + rumus dari baris terakhir.
+    // 5) Siapkan baris baru: tambah baris grid bila perlu, salin format + rumus dari baris contoh.
     const baru = terakhir + 1;
     const permintaan = [];
     if (baru > info.baris) permintaan.push({ appendDimension: { sheetId: info.gid, dimension: 'ROWS', length: baru - info.baris + 20 } });
     if (terakhir > barisHeader) {
       permintaan.push({ copyPaste: {
-        source: { sheetId: info.gid, startRowIndex: terakhir - 1, endRowIndex: terakhir, startColumnIndex: 0, endColumnIndex: nCol },
+        source: { sheetId: info.gid, startRowIndex: contoh - 1, endRowIndex: contoh, startColumnIndex: 0, endColumnIndex: nCol },
         destination: { sheetId: info.gid, startRowIndex: baru - 1, endRowIndex: baru, startColumnIndex: 0, endColumnIndex: nCol },
         pasteType: 'PASTE_NORMAL',
       } });
@@ -228,6 +231,44 @@ export function tambahBaris({ sheetId, tab, header, idxNama, idxTanggal, nilaiKo
     cacheRumus.delete(`${sheetId}|${tab}|${nCol}`);
     return { baris: baru, sudahAda: false, kolomRumus };
   });
+}
+
+// ── Pemilihan baris contoh untuk menyalin format ──────────────────────────────────────────────
+const kunciWarna = (c) => (!c ? 'putih' : [c.red ?? 0, c.green ?? 0, c.blue ?? 0].map((x) => Math.round(x * 20)).join(','));
+const putih = (c) => !c || ((c.red ?? 0) > 0.97 && (c.green ?? 0) > 0.97 && (c.blue ?? 0) > 0.97) || (c.red === undefined && c.green === undefined && c.blue === undefined);
+const formatAngka = (n) => !!n && (n.type === 'CURRENCY' || /Rp|\[\$|#,##0|\$/.test(n.pattern || ''));
+
+/**
+ * Dari ≤60 baris data terakhir, pilih baris yang paling pantas dijadikan contoh format: (1) tidak ada sel berwarna,
+ * (2) paling banyak sel berformat angka/rupiah, (3) paling baru. Bila semuanya berwarna, pakai yang paling sedikit
+ * menyimpang dari warna umum kolomnya. Gagal membaca format → pakai baris terakhir (perilaku lama).
+ */
+async function pilihBarisContoh(sheetId, { q, kolAkhir, barisHeader }, terakhir) {
+  try {
+    const dari = Math.max(barisHeader + 1, terakhir - 59);
+    const j = await sheetsApi(`/v4/spreadsheets/${encodeURIComponent(sheetId)}`, {
+      query: { ranges: `${q}!A${dari}:${kolAkhir}${terakhir}`, includeGridData: 'true', fields: 'sheets.data.rowData.values.effectiveFormat(backgroundColor,numberFormat)' },
+    });
+    const data = j.sheets?.[0]?.data?.[0]?.rowData || [];
+    if (!data.length) return terakhir;
+    const baris = data.map((r, i) => {
+      const v = r.values || [];
+      return { no: dari + i, warna: v.map((c) => c.effectiveFormat?.backgroundColor), angka: v.filter((c) => formatAngka(c.effectiveFormat?.numberFormat)).length };
+    });
+    // tidak ada sel berwarna?
+    const polos = baris.filter((b) => b.warna.every(putih));
+    const unggul = (daftar) => { const maks = Math.max(...daftar.map((b) => b.angka)); return daftar.filter((b) => b.angka === maks).pop().no; };
+    if (polos.length) return unggul(polos);
+    // semua baris berwarna: pilih yang paling sedikit menyimpang dari warna umum (modus) tiap kolom
+    const nKol = Math.max(...baris.map((b) => b.warna.length));
+    const modus = Array.from({ length: nKol }, (_, c) => {
+      const hit = new Map(); baris.forEach((b) => { const k = kunciWarna(b.warna[c]); hit.set(k, (hit.get(k) || 0) + 1); });
+      return [...hit.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    });
+    const simpang = baris.map((b) => ({ ...b, sim: b.warna.filter((w, c) => kunciWarna(w) !== modus[c]).length }));
+    const minim = Math.min(...simpang.map((b) => b.sim));
+    return unggul(simpang.filter((b) => b.sim === minim));
+  } catch { return terakhir; }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
