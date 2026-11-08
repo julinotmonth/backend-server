@@ -630,7 +630,7 @@ export async function fetchTabCsv(sheetId, tabName, gid = null) {
   // Dengan gid, Google membaca tab yang PERSIS itu. Dengan nama, kalau nama tidak cocok
   // persis Google diam-diam mengembalikan sheet PERTAMA di file — sumber data salah arah.
   const sasaran = gid ? `gid=${encodeURIComponent(gid)}` : `sheet=${encodeURIComponent(tabName)}`;
-  const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&${sasaran}`;
+  const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&${sasaran}&_=${Date.now()}`; // _=… mencegah hasil lama dari cache
   // Timeout + ulang otomatis untuk gangguan sementara (lihat googleFetch.js).
   const { ok, status, text } = await fetchGoogleText(url);
   if (!ok) throw Object.assign(new Error(`Gagal membaca tab "${tabName}" (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });

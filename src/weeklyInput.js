@@ -580,7 +580,7 @@ export function buatInputManual(d) {
     const dari = tgl(req.query.dari), sampai = tgl(req.query.sampai);
     const kunciUrut = { tanggal: 'tanggal', nama: 'nama_barang', jumlah: 'jumlah', waktu: 'imported_at' }[String(req.query.urut)] || 'tanggal';
     const sortir = String(req.query.sortir) === 'asc' ? 'ASC' : 'DESC';
-    const batas = Math.min(100, Math.max(5, Number(req.query.batas) || 25));
+    const batas = Math.min(200, Math.max(5, Number(req.query.batas) || 25));
     const halaman = Math.max(1, Number(req.query.halaman) || 1);
 
     const p = [site, direction], where = ['site = $1', 'direction = $2'];
