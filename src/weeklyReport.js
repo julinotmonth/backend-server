@@ -199,6 +199,14 @@ export function classifySection(row, site) {
 
 // ── Parsing ───────────────────────────────────────────────────────────────
 const BULAN_ID = ['januari','februari','maret','april','mei','juni','juli','agustus','september','oktober','november','desember'];
+// Nama bulan → nomor, termasuk singkatan & ejaan Inggris yang lazim diketik di sheet (Jan, Agu/Agt, Okt, Nop, Des, August, October, ...).
+const NOMOR_BULAN = (() => {
+  const m = new Map();
+  BULAN_ID.forEach((n, i) => { m.set(n, i + 1); m.set(n.slice(0, 3), i + 1); });
+  Object.entries({ january: 1, february: 2, march: 3, may: 5, june: 6, july: 7, august: 8, october: 10, december: 12,
+    agt: 8, agu: 8, agust: 8, sept: 9, nop: 11, nopember: 11, pebruari: 2 }).forEach(([k, v]) => m.set(k, v));
+  return m;
+})();
 
 /** "03 Agustus 2026" | "2026-08-03" | "3/8/2026" → "YYYY-MM-DD" | null */
 /** @param {string} raw @param {string|number} [bulanHint] kolom "Bulan" eksplisit di baris yang sama (kalau ada), dipakai buat membongkar tanggal ambigu "A/B/YYYY" */
@@ -207,10 +215,15 @@ export function parseTanggal(raw, bulanHint) {
   if (!s) return null;
   let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  m = s.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
+  // "05 November 2026", "5 Nov 2026", "05-Nov-2026", "Senin, 5 Agu 26" (nama bulan Indonesia/Inggris, lengkap/singkat)
+  m = s.replace(/^[A-Za-z]+,\s*/, '').match(/^(\d{1,2})[\s\-/.]+([A-Za-z]+)\.?[\s\-/.,]+(\d{2}|\d{4})$/);
   if (m) {
-    const bulan = BULAN_ID.indexOf(m[2].toLowerCase());
-    if (bulan >= 0) return `${m[3]}-${String(bulan + 1).padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+    const bulan = NOMOR_BULAN.get(m[2].toLowerCase());
+    const hari = Number(m[1]);
+    if (bulan && hari >= 1 && hari <= 31) {
+      const th = m[3].length === 2 ? `20${m[3]}` : m[3];
+      return `${th}-${String(bulan).padStart(2, '0')}-${String(hari).padStart(2, '0')}`;
+    }
   }
   // Format bergaris miring "A/B/YYYY" itu ambigu — bisa D/M/Y (mis. sheet MS
   // KHT: "04/09/2026" = 4 September) atau M/D/Y (mis. sheet MS Blora yang
@@ -241,6 +254,9 @@ export function parseTanggal(raw, bulanHint) {
   // parseAngka() dan jadi angka sampah ("170926").
   m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2})$/);
   if (m) return `20${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  // JANGAN tebak angka polos: new Date("2026") = 1 Januari 2026 — inilah yang dulu membuat baris tanpa tanggal
+  // (atau dengan format tanggal yang tak dikenali) tampil sebagai "1 Jan 2026".
+  if (/^[\d.,\s-]+$/.test(s)) return null;
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
 }
@@ -629,11 +645,24 @@ export function extractSheetId(input) {
 export async function fetchTabCsv(sheetId, tabName, gid = null) {
   // Dengan gid, Google membaca tab yang PERSIS itu. Dengan nama, kalau nama tidak cocok
   // persis Google diam-diam mengembalikan sheet PERTAMA di file — sumber data salah arah.
+  const tolak = (tab, status) => Object.assign(new Error(`Gagal membaca tab "${tab}" (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
+  // 1) Endpoint EXPORT (bila gid diketahui): mengembalikan teks persis seperti tampil di sheet.
+  //    Endpoint gviz di bawah menebak SATU tipe per kolom, lalu mengosongkan sel yang tipenya beda. Kolom Tanggal di
+  //    tab IN_* berisi campuran tanggal asli dan teks ("16 Oktober 2026"), sehingga teksnya diam-diam jadi KOSONG
+  //    -> tanggal gagal terbaca -> dulu jatuh ke "1 Jan 2026".
+  if (gid) {
+    try {
+      const r = await fetchGoogleText(`${SHEETS_BASE}/spreadsheets/d/${sheetId}/export?format=csv&gid=${encodeURIComponent(gid)}&_=${Date.now()}`);
+      if (r.ok && !r.text.trimStart().startsWith('<')) return r.text;
+    } catch { /* jatuh ke gviz */ }
+  }
+  // 2) Cadangan: gviz. Dengan gid, Google membaca tab yang PERSIS itu. Dengan nama, kalau nama tidak cocok
+  //    persis Google diam-diam mengembalikan sheet PERTAMA di file — sumber data salah arah.
   const sasaran = gid ? `gid=${encodeURIComponent(gid)}` : `sheet=${encodeURIComponent(tabName)}`;
   const url = `${SHEETS_BASE}/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&${sasaran}&_=${Date.now()}`; // _=… mencegah hasil lama dari cache
   // Timeout + ulang otomatis untuk gangguan sementara (lihat googleFetch.js).
   const { ok, status, text } = await fetchGoogleText(url);
-  if (!ok) throw Object.assign(new Error(`Gagal membaca tab "${tabName}" (HTTP ${status}). Pastikan sheet dibagikan sebagai "Anyone with the link — Viewer".`), { status: 400 });
+  if (!ok) throw tolak(tabName, status);
   if (text.trimStart().startsWith('<')) throw Object.assign(new Error(`Tab "${tabName}" tidak bisa diakses publik. Ubah izin berbagi sheet menjadi "Anyone with the link".`), { status: 400 });
   return text;
 }
