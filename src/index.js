@@ -15,6 +15,7 @@ import { WORK_TARGET_SCHEMA, workTargetRouter, startWorkTargetAutoSync } from '.
 import { MIN_STOCK_SCHEMA, minStockRouter, startMinStockAutoSync } from './minStock.js';
 import { OUTSTANDING_PR_SCHEMA, outstandingPrRouter, startOutstandingPrAutoSync } from './outstandingPr.js';
 import { CHANGE_LOG_SCHEMA, changeLogRouter } from './changeLog.js';
+import { GOOD_RECEIPT_SCHEMA, goodReceiptRouter } from './goodReceipt.js';
 import { rapikanSiteKembar } from './siteCleanup.js';
 import { sesuaikanSite } from './siteRename.js';
 
@@ -503,6 +504,7 @@ app.use('/api', minStockRouter());          // ← Pencapaian Minimum Stok
 app.use('/api', outstandingPrRouter());     // ← Outstanding PR
 app.use('/api', changeLogRouter());       // ← notifikasi perubahan Laporan Mingguan
 app.use('/api', searchRouter());          // ← Global Search (Laporan Mingguan + PICA)
+app.use('/api', goodReceiptRouter());     // ← arsip Good Receipt (upload/lihat PDF per site)
 
 app.use((req, res) => res.status(404).json({ error: `No route: ${req.method} ${req.path}` }));
 
@@ -529,6 +531,7 @@ async function start() {
   await pool.query(MIN_STOCK_SCHEMA);       // ← tabel Pencapaian Minimum Stok
   await pool.query(OUTSTANDING_PR_SCHEMA);  // ← tabel Outstanding PR
   await pool.query(CHANGE_LOG_SCHEMA);      // ← tabel log perubahan (notifikasi)
+  await pool.query(GOOD_RECEIPT_SCHEMA);    // ← arsip dokumen Good Receipt (GR)
   await sesuaikanSite();                    // ← WS Dawuan → WS Cibungur, hapus MS Bekasi (bila kosong)
   await rapikanSiteKembar();                // ← buang site kembar yang kosong (mis. "LNG Sangkulirang" ganda)
   siap = true;
