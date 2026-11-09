@@ -174,15 +174,23 @@ const ALOKASI_LAIN = [
 // bukan nama mesin/kegiatan seperti site lain.
 const KODE_ISO_TANK = /^[A-Z]{4}\d{7}$/;
 
+// Kode biaya per baris di sheet (kolom "MH/OH" pada template Excel): MH = Part Maintenance,
+// OH = Overhold/Overhaul, OLI = Consumption OLI; R/N/K/S/G/L/O/T = Lain-Lain (jasa service, instalasi
+// baru, kalibrasi, sedot limbah, analisa gas, analisa oli, others, tools). Template Excel menjumlahkan
+// per baris lewat SUMIFS(Alokasi + kode ini), jadi kode inilah yang menentukan seksi — alokasi "OTHERS"
+// bisa masuk Part Maintenance (kode MH) maupun Lain-Lain (kode O).
+const KODE_BIAYA_SEKSI = new Map([['MH', 'MAINT'], ['OH', 'OH'], ['OLI', 'OLI']]);
+const KODE_BIAYA_LAIN = new Set(['R', 'N', 'K', 'S', 'G', 'L', 'O', 'T']);
+
 export function classifySection(row, site) {
   const alokasiAsli = String(row.alokasi || '').trim();
   const alokasi = alokasiAsli.toLowerCase();
   const nama = String(row.namaBarang || '').toLowerCase();
   const ket = `${row.detailAlokasi || ''} ${row.keterangan || ''}`.toLowerCase();
 
-  // Urutan penting: baris berbasis jasa / OTHERS selalu masuk Lain-Lain,
+  // Urutan penting: baris berbasis jasa selalu masuk Lain-Lain,
   // meski keterangannya menyebut overhaul — sama seperti template Excel.
-  if (ALOKASI_LAIN.includes(alokasi) || alokasi.startsWith('jasa')) return 'LAIN';
+  if (alokasi.startsWith('jasa')) return 'LAIN';
   if (KODE_ISO_TANK.test(alokasiAsli.toUpperCase().replace(/\s+/g, ''))) return 'ISOTANK';
   // LNG Sangkulirang: sheet rekapnya sendiri ("Week LNG Sngkurilang") cuma
   // punya DUA kelompok — ISO Tank dan Lain-Lain — semua kategori lain (PRS,
@@ -192,6 +200,12 @@ export function classifySection(row, site) {
   // Tanpa pengecualian ini, semua kategori itu jatuh ke default MAINT di
   // bawah karena tak satu pun cocok kata kunci overhaul/oli/jasa.
   if (site === 'sangkulirang') return 'LAIN';
+  // Kode biaya dari sheet (bila ada & valid) mengalahkan tebakan dari teks di bawah.
+  const kode = String(row.kodeBiaya || '').trim().toUpperCase();
+  if (KODE_BIAYA_SEKSI.has(kode)) return KODE_BIAYA_SEKSI.get(kode);
+  if (KODE_BIAYA_LAIN.has(kode)) return 'LAIN';
+  // Tanpa kode: alokasi OTHERS/jasa… dianggap Lain-Lain (perilaku lama).
+  if (ALOKASI_LAIN.includes(alokasi)) return 'LAIN';
   if (/overhaul|overhold|\boh\b/.test(ket)) return 'OH';
   if (/\boli\b|pelumas|lubric/.test(nama)) return 'OLI';
   return 'MAINT';
@@ -323,6 +337,27 @@ const HEADER_MAP = {
   'jenis': 'jenis', 'merk': 'merk', 'type': 'tipe', 'tipe': 'tipe',
 };
 
+/**
+ * Cari kolom kode biaya (MH/OH/OLI/R/N/K/S/G/L/O/T) di baris header sebuah tab — header "MH/OH",
+ * atau kolom tanpa judul / "Column2" bawaan tabel Excel. Dipastikan lewat isinya: minimal 90% sel
+ * terisi berupa kode valid, jadi kolom lain tak akan salah terbaca. -1 bila tidak ada.
+ */
+function cariKolomKodeBiaya(rows, headIdx) {
+  const head = rows[headIdx];
+  const sampel = rows.slice(headIdx + 1, headIdx + 400);
+  const namaKolom = new Set(['mh/oh', 'mh / oh', 'mhoh', 'kode biaya', 'jenis biaya']);
+  for (let i = 0; i < head.length; i++) {
+    const h = norm(head[i]);
+    if (HEADER_MAP[h]) continue;
+    if (!(namaKolom.has(h) || h === '' || /^column\d+$/.test(h))) continue;
+    const isi = sampel.map((r) => String(r[i] ?? '').trim().toUpperCase()).filter(Boolean);
+    if (isi.length < 3) continue;
+    const valid = isi.filter((v) => KODE_BIAYA_SEKSI.has(v) || KODE_BIAYA_LAIN.has(v)).length;
+    if (valid / isi.length >= 0.9) return i;
+  }
+  return -1;
+}
+
 /** CSV → array of record. Menangani kutip ganda dan newline di dalam sel. */
 export function parseCsv(text) {
   const rows = [];
@@ -346,6 +381,7 @@ export function rowsToRecords(rows, site) {
   const headIdx = rows.findIndex((r) => r.some((c) => ['nama barang', 'nama aset', 'nama item'].includes(norm(c))));
   if (headIdx < 0) return [];
   const cols = rows[headIdx].map((c) => HEADER_MAP[norm(c)] || null);
+  const idxKodeBiaya = cariKolomKodeBiaya(rows, headIdx);
 
   // Sheet "LIST ALL ASET ..." punya baris judul sub-bab di antara item
   // (mis. "Main Office", "MS WUNUT") — sel-sel lain di baris itu kosong
@@ -404,6 +440,7 @@ export function rowsToRecords(rows, site) {
       jenis: String(o.jenis || '').trim(),
       merk: String(o.merk || '').trim(),
       tipe: String(o.tipe || '').trim(),
+      kodeBiaya: idxKodeBiaya >= 0 ? String(r[idxKodeBiaya] ?? '').trim().toUpperCase() : '',
       // Isi sel ASLI baris ini (sejajar dengan header sheet) + posisinya — untuk Export berformat template sheet.
       raw: cols.map((_, c) => String(r[c] ?? '')),
       urut: headIdx + 1 + posisi,
