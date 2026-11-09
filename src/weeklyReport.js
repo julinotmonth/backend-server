@@ -66,6 +66,8 @@ ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS tipe  TEXT NOT NULL DEFA
 -- Terisi pada sync/import berikutnya (baris lama tetap bisa diekspor dengan kolom standar).
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS raw  JSONB;
 ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS urut INTEGER;
+-- Kode biaya dari sheet (MH/OH/OLI/R/N/K/S/G/L/O/T): menentukan seksi & baris Jasa pada laporan Barang Keluar.
+ALTER TABLE weekly_report_rows ADD COLUMN IF NOT EXISTS kode_biaya TEXT NOT NULL DEFAULT '';
 
 -- Input manual lewat website (weeklyInput.js): baris yang berasal dari form, dan status pengirimannya ke Google Sheet.
 --   sheet_status: 'ok' (sudah di sheet) | 'pending' (menunggu dikirim) | 'gagal' (Google menolak — lihat sheet_error)
@@ -180,7 +182,8 @@ const KODE_ISO_TANK = /^[A-Z]{4}\d{7}$/;
 // per baris lewat SUMIFS(Alokasi + kode ini), jadi kode inilah yang menentukan seksi — alokasi "OTHERS"
 // bisa masuk Part Maintenance (kode MH) maupun Lain-Lain (kode O).
 const KODE_BIAYA_SEKSI = new Map([['MH', 'MAINT'], ['OH', 'OH'], ['OLI', 'OLI']]);
-const KODE_BIAYA_LAIN = new Set(['R', 'N', 'K', 'S', 'G', 'L', 'O', 'T']);
+// P / INV / HSE / TOOLS ikut dikenali karena benar-benar muncul di sheet (arti P & INV belum dikonfirmasi) — masuk Lain-Lain.
+const KODE_BIAYA_LAIN = new Set(['R', 'N', 'K', 'S', 'G', 'L', 'O', 'T', 'TOOLS', 'P', 'INV', 'HSE']);
 
 export function classifySection(row, site) {
   const alokasiAsli = String(row.alokasi || '').trim();
@@ -342,18 +345,26 @@ const HEADER_MAP = {
  * atau kolom tanpa judul / "Column2" bawaan tabel Excel. Dipastikan lewat isinya: minimal 90% sel
  * terisi berupa kode valid, jadi kolom lain tak akan salah terbaca. -1 bila tidak ada.
  */
-function cariKolomKodeBiaya(rows, headIdx) {
+function cariKolomKodeBiaya(rows, headIdx, cols) {
   const head = rows[headIdx];
   const sampel = rows.slice(headIdx + 1, headIdx + 400);
   const namaKolom = new Set(['mh/oh', 'mh / oh', 'mhoh', 'kode biaya', 'jenis biaya']);
+  const lolos = (i) => {
+    const isi = sampel.map((r) => String(r[i] ?? '').trim().toUpperCase()).filter(Boolean);
+    if (isi.length < 3) return false;
+    const valid = isi.filter((v) => KODE_BIAYA_SEKSI.has(v) || KODE_BIAYA_LAIN.has(v)).length;
+    return valid / isi.length >= 0.9;
+  };
   for (let i = 0; i < head.length; i++) {
     const h = norm(head[i]);
     if (HEADER_MAP[h]) continue;
-    if (!(namaKolom.has(h) || h === '' || /^column\d+$/.test(h))) continue;
-    const isi = sampel.map((r) => String(r[i] ?? '').trim().toUpperCase()).filter(Boolean);
-    if (isi.length < 3) continue;
-    const valid = isi.filter((v) => KODE_BIAYA_SEKSI.has(v) || KODE_BIAYA_LAIN.has(v)).length;
-    if (valid / isi.length >= 0.9) return i;
+    if ((namaKolom.has(h) || h === '' || /^column\d+$/.test(h)) && lolos(i)) return i;
+  }
+  // Kolom kode yang judulnya dikenali sebagai Alokasi (mis. "Kategori"): hanya dianggap kolom kode bila
+  // sheet punya kolom Alokasi lain, dan isinya murni kode. Kalau tidak, Alokasi asli tertimpa kode.
+  const kolomAlokasi = cols.map((c, i) => (c === 'alokasi' ? i : -1)).filter((i) => i >= 0);
+  if (kolomAlokasi.length > 1) {
+    for (const i of kolomAlokasi) if (norm(head[i]) !== 'alokasi' && lolos(i)) return i;
   }
   return -1;
 }
@@ -381,7 +392,8 @@ export function rowsToRecords(rows, site) {
   const headIdx = rows.findIndex((r) => r.some((c) => ['nama barang', 'nama aset', 'nama item'].includes(norm(c))));
   if (headIdx < 0) return [];
   const cols = rows[headIdx].map((c) => HEADER_MAP[norm(c)] || null);
-  const idxKodeBiaya = cariKolomKodeBiaya(rows, headIdx);
+  const idxKodeBiaya = cariKolomKodeBiaya(rows, headIdx, cols);
+  if (idxKodeBiaya >= 0) cols[idxKodeBiaya] = null; // jangan sampai kolom kode menimpa Alokasi
 
   // Sheet "LIST ALL ASET ..." punya baris judul sub-bab di antara item
   // (mis. "Main Office", "MS WUNUT") — sel-sel lain di baris itu kosong
@@ -976,7 +988,7 @@ const ketJumlah = (jumlah, satuan) => `${Number(jumlah) || ''} ${satuan || ''}`.
 const BATCH_UPSERT = 250;
 const KOLOM_INSERT = ['id', 'site', 'direction', 'source_tab', 'row_hash', 'tanggal', 'minggu', 'bulan', 'tahun', 'kode',
   'nama_barang', 'jumlah', 'satuan', 'alokasi', 'detail_alokasi', 'pic', 'rh', 'harga', 'total_harga',
-  'no_mr', 'gen_bus', 'status_smr', 'no_shipment', 'keterangan', 'jenis', 'merk', 'tipe', 'section', 'raw', 'urut', 'imported_by'];
+  'no_mr', 'gen_bus', 'status_smr', 'no_shipment', 'keterangan', 'jenis', 'merk', 'tipe', 'section', 'kode_biaya', 'raw', 'urut', 'imported_by'];
 // Kolom yang di-refresh saat baris sudah ada (SEMUA kolom data, bukan sebagian — lihat catatan lama:
 // kolom yang tidak disebut di sini macet selamanya di nilai sync pertama).
 const KOLOM_REFRESH = KOLOM_INSERT.filter((k) => !['id', 'site', 'direction', 'row_hash', 'imported_by'].includes(k));
@@ -1032,7 +1044,7 @@ export const WeeklyReports = {
             `wr-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`, site, direction, tab, hashes[mulai + i],
             r.tanggal, r.minggu, r.bulan, r.tahun, r.kode, r.namaBarang, r.jumlah, r.satuan, r.alokasi,
             r.detailAlokasi, r.pic, r.rh, r.harga, r.totalHarga, r.noMr, r.genBus, r.statusSmr,
-            r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section,
+            r.noShipment, r.keterangan, r.jenis, r.merk, r.tipe, r.section, r.kodeBiaya || '',
             r.raw ? JSON.stringify(r.raw) : null, r.urut ?? null, importedBy);
         });
         const { rows } = await db.query(sqlUpsertBatch(potong.length), params);
@@ -1119,7 +1131,7 @@ export const WeeklyReports = {
       totalHarga: Number(r.total_harga), noMr: r.no_mr, genBus: r.gen_bus,
       statusSmr: r.status_smr, noShipment: r.no_shipment, keterangan: r.keterangan,
       jenis: r.jenis, merk: r.merk, tipe: r.tipe,
-      section: r.section, importedAt: r.imported_at, importedBy: r.imported_by,
+      section: r.section, kodeBiaya: r.kode_biaya || '', importedAt: r.imported_at, importedBy: r.imported_by,
     }));
     await attachEstimasiHarga(hasil);
     return hasil;
