@@ -11,6 +11,7 @@ import { sealPassword } from './vault.js';
 import { searchRouter } from './search.js';
 import { WEEKLY_REPORT_SCHEMA, weeklyReportRouter, startAutoSync } from './weeklyReport.js';
 import { PICA_SCHEMA, picaRouter, startPicaAutoSync } from './pica.js';
+import { PICA_INPUT_SCHEMA, picaInputRouter } from './picaInput.js';
 import { WORK_TARGET_SCHEMA, workTargetRouter, startWorkTargetAutoSync } from './workTarget.js';
 import { MIN_STOCK_SCHEMA, minStockRouter, startMinStockAutoSync } from './minStock.js';
 import { OUTSTANDING_PR_SCHEMA, outstandingPrRouter, startOutstandingPrAutoSync } from './outstandingPr.js';
@@ -499,6 +500,7 @@ app.get('/api/reports/summary', requireAuth, asyncRoute(async (_req, res) => {
 
 app.use('/api', weeklyReportRouter());
 app.use('/api', picaRouter());
+app.use('/api', picaInputRouter());   // PICA: input manual + import Excel
 app.use('/api', workTargetRouter());
 app.use('/api', minStockRouter());          // ← Pencapaian Minimum Stok
 app.use('/api', outstandingPrRouter());     // ← Outstanding PR
@@ -527,6 +529,7 @@ async function start() {
   await migrate();
   await pool.query(WEEKLY_REPORT_SCHEMA);   // ← tabel laporan mingguan
   await pool.query(PICA_SCHEMA);            // ← tabel PICA tracker
+  await pool.query(PICA_INPUT_SCHEMA);      // ← kolom origin/kategori (input manual PICA)
   await pool.query(WORK_TARGET_SCHEMA);     // ← tabel Work Target tracker
   await pool.query(MIN_STOCK_SCHEMA);       // ← tabel Pencapaian Minimum Stok
   await pool.query(OUTSTANDING_PR_SCHEMA);  // ← tabel Outstanding PR
