@@ -335,9 +335,10 @@ export const PicaItems = {
     return { inserted, updated, removed, total: records.length };
   },
 
+  /** site = null → semua site (dipakai tampilan "Semua Site" Super Admin). */
   async list(site) {
     const { rows } = await query(
-      `SELECT * FROM pica_items WHERE site = $1 ORDER BY tanggal NULLS LAST, no`, [site]);
+      `SELECT * FROM pica_items WHERE ($1::text IS NULL OR site = $1) ORDER BY site, tanggal NULLS LAST, no`, [site]);
     return rows.map((r) => ({
       id: r.id, site: r.site, no: r.no, tanggal: r.tanggal, problem: r.problem,
       identifikasi: r.identifikasi, deskripsi: r.deskripsi, targetDate: r.target_date,
@@ -386,6 +387,7 @@ export function picaRouter() {
   r.get('/pica', requireAuth, wrap(async (req, res) => {
     const site = req.query.site || (req.auth.assignedSite !== 'global' ? req.auth.assignedSite : null);
     if (!site) return res.status(400).json({ error: 'Parameter site wajib diisi.' });
+    siteGuard(req, site);   // akun yang dibatasi ke satu site tidak boleh membaca PICA site lain
     res.json(await PicaItems.list(site));
   }));
 

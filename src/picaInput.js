@@ -13,7 +13,8 @@
 import express from 'express';
 import { pool, query } from './db.js';
 import { requireAuth } from './auth.js';
-import { parseTanggalPica, siteGuard } from './pica.js';
+import { parseTanggalPica, siteGuard, PicaItems } from './pica.js';
+import { siteScope } from './siteAccess.js';
 import { catatPerubahan, bandingkan } from './changeLog.js';
 
 export const PICA_INPUT_SCHEMA = `
@@ -281,6 +282,13 @@ export function picaInputRouter() {
   const r = express.Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   const galatBadRequest = (res, galat) => res.status(400).json({ error: galat.join(' '), galat });
+
+  // Semua isu dari semua site sekaligus — tampilan "Semua Site". Hanya akun yang tidak dibatasi ke satu site
+  // (Super Admin / global); akun site biasa memakai /pica?site=… untuk site-nya sendiri.
+  r.get('/pica/semua', requireAuth, wrap(async (req, res) => {
+    if (siteScope(req.auth)) return res.status(403).json({ error: 'Tampilan semua site hanya untuk Super Admin.' });
+    res.json(await PicaItems.list(null));
+  }));
 
   // Tambah isu
   r.post('/pica/items', requireAuth, wrap(async (req, res) => {
