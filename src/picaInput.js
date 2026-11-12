@@ -12,12 +12,31 @@
 
 import express from 'express';
 import { pool, query } from './db.js';
-import { requireAuth } from './auth.js';
+import { requireAuth, requireSuperAdmin } from './auth.js';
 import { parseTanggalPica, siteGuard, PicaItems } from './pica.js';
 import { siteScope } from './siteAccess.js';
 import { catatPerubahan, bandingkan } from './changeLog.js';
 
+// Kategori awal — hanya dipakai sekali, saat tabel pica_kategori pertama kali dibuat. Setelah itu Super Admin
+// yang mengatur daftarnya lewat aplikasi (tambah / ubah nama / urutan / hapus).
+export const KATEGORI_BAWAAN = ['Spare Part', 'Safety Stock', 'Pengadaan / Vendor', 'Aset', 'Administrasi', 'Lainnya'];
+
 export const PICA_INPUT_SCHEMA = `
+DO $$
+BEGIN
+  IF to_regclass('public.pica_kategori') IS NULL THEN
+    CREATE TABLE pica_kategori (
+      id         TEXT PRIMARY KEY,
+      nama       TEXT NOT NULL,
+      urutan     INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_by TEXT
+    );
+    INSERT INTO pica_kategori (id, nama, urutan, created_by) VALUES
+${KATEGORI_BAWAAN.map((k, i) => `      ('kat-awal-${i + 1}', '${k.replace(/'/g, "''")}', ${i + 1}, 'sistem')`).join(',\n')};
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pica_kategori_nama ON pica_kategori (lower(nama));
 ALTER TABLE pica_items ADD COLUMN IF NOT EXISTS origin     TEXT NOT NULL DEFAULT 'sheet';
 ALTER TABLE pica_items ADD COLUMN IF NOT EXISTS kategori   TEXT NOT NULL DEFAULT '';
 ALTER TABLE pica_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
@@ -28,7 +47,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_pica_manual_no ON pica_items (site, lower(n
 
 // ── Nilai yang diizinkan ──────────────────────────────────────────────────
 export const PICA_STATUS = ['On Going', 'Close', 'Overdue'];
-export const PICA_KATEGORI = ['Spare Part', 'Safety Stock', 'Pengadaan / Vendor', 'Aset', 'Administrasi', 'Lainnya'];
+const MAKS_NAMA_KATEGORI = 40;
 
 const MAKS = { no: 20, problem: 500, identifikasi: 2000, deskripsi: 8000, pic: 120, catatan: 4000 };
 const MAKS_BARIS_IMPOR = 1000;
@@ -45,10 +64,21 @@ export function normStatus(raw) {
   return null;
 }
 
-export function normKategori(raw) {
-  const s = rapikan(raw).toLowerCase().replace(/\s*\/\s*/g, ' / ');
+/** Cocokkan teks bebas ke nama kategori resmi (abaikan huruf besar/kecil dan spasi di sekitar "/"). '' = tanpa kategori; null = tak dikenal. */
+const lipatKategori = (t) => rapikan(t).toLowerCase().replace(/\s+/g, ' ').replace(/\s*\/\s*/g, ' / ');
+export function normKategori(raw, daftar = KATEGORI_BAWAAN) {
+  const s = lipatKategori(raw);
   if (!s) return '';
-  return PICA_KATEGORI.find((k) => k.toLowerCase() === s) ?? null;
+  return daftar.find((k) => lipatKategori(k) === s) ?? null;
+}
+
+/** Nama kategori baru/ubah nama: rapikan spasi, 1–40 karakter. Mengembalikan { nama } atau { galat }. */
+export function bersihkanNamaKategori(raw) {
+  const nama = rapikan(raw).replace(/\s+/g, ' ');
+  if (!nama) return { galat: 'Nama kategori wajib diisi.' };
+  if (nama.length > MAKS_NAMA_KATEGORI) return { galat: `Nama kategori maksimal ${MAKS_NAMA_KATEGORI} karakter.` };
+  if (/[\u0000-\u001f]/.test(nama)) return { galat: 'Nama kategori mengandung karakter yang tidak diizinkan.' };
+  return { nama };
 }
 
 /** "Week 5" / "week05" / "W5" / "Minggu 5" / "5" → "Week 05". null kalau bukan minggu 1–53. */
@@ -87,7 +117,7 @@ export function ringkasTerbaru(updates) {
  * Memeriksa satu isu dari form/Excel. Mengembalikan { nilai, galat } — galat berisi SEMUA masalah sekaligus
  * (bukan berhenti di yang pertama) supaya pengguna bisa membereskan satu baris dalam sekali jalan.
  */
-export function bersihkanIsu(input, { wajibNo = false } = {}) {
+export function bersihkanIsu(input, { wajibNo = false, kategori: daftarKategori = KATEGORI_BAWAAN } = {}) {
   const galat = [];
   const no = rapikan(input.no);
   const problem = rapikan(input.problem);
@@ -97,7 +127,7 @@ export function bersihkanIsu(input, { wajibNo = false } = {}) {
   const tanggal = parseTanggalPica(input.tanggal);
   const targetDate = rapikan(input.targetDate) ? parseTanggalPica(input.targetDate) : null;
   const status = normStatus(input.status);
-  const kategori = normKategori(input.kategori);
+  const kategori = normKategori(input.kategori, daftarKategori);
 
   if (wajibNo && !no) galat.push('No wajib diisi.');
   if (no.length > MAKS.no) galat.push(`No maksimal ${MAKS.no} karakter.`);
@@ -111,7 +141,9 @@ export function bersihkanIsu(input, { wajibNo = false } = {}) {
   if (rapikan(input.targetDate) && !tanggalValid(targetDate)) galat.push(`Target Date “${rapikan(input.targetDate)}” tidak terbaca.`);
   if (tanggalValid(tanggal) && tanggalValid(targetDate) && targetDate < tanggal) galat.push('Target Date lebih awal dari Date.');
   if (status === null) galat.push(`Status “${rapikan(input.status)}” tidak dikenal — pilih ${PICA_STATUS.join(' / ')}.`);
-  if (kategori === null) galat.push(`Kategori “${rapikan(input.kategori)}” tidak dikenal — pilih salah satu: ${PICA_KATEGORI.join(', ')}.`);
+  if (kategori === null) {
+    galat.push(`Kategori “${rapikan(input.kategori)}” tidak dikenal — ${daftarKategori.length ? `pilih salah satu: ${daftarKategori.join(', ')}` : 'belum ada kategori yang diatur'}.`);
+  }
 
   const updates = [];
   for (const u of input.updates || []) {
@@ -148,7 +180,7 @@ const sama = (a, b) => JSON.stringify(a) === JSON.stringify(b);
  * @param rows      [{ baris, no, tanggal, problem, ... , updates }]  (baris = nomor baris di Excel)
  * @param existing  isu yang sudah ada di site: [{ id, no, origin, tanggal, problem, ..., updates }]
  */
-export function rencanaImport(rows, existing) {
+export function rencanaImport(rows, existing, kategori = KATEGORI_BAWAAN) {
   const perNo = new Map(existing.map((e) => [String(e.no).toLowerCase(), e]));
   // Baris tanpa No yang tanggal + problem-nya sama dengan isu manual yang sudah ada dianggap isu itu juga,
   // supaya mengimpor ulang file yang sama tidak menggandakan isu.
@@ -160,7 +192,7 @@ export function rencanaImport(rows, existing) {
   const antrean = []; // baris tanpa No → diberi nomor setelah nomor eksplisit semuanya diketahui
 
   for (const r of rows) {
-    const { galat, nilai } = bersihkanIsu(r);
+    const { galat, nilai } = bersihkanIsu(r, { kategori });
     if (!galat.length && !nilai.no) {
       const kembar = perIsu.get(kunciIsu(nilai));
       if (kembar && !noDiFile.has(String(kembar.no).toLowerCase())) nilai.no = kembar.no;
@@ -277,6 +309,12 @@ async function ubahIsu(exec, id, d, oleh) {
 const bentukLama = (it) => ({ ...it, target_date: it.target_date, latest_week: it.latest_week, latest_note: it.latest_note });
 const bentukBaru = (d) => ({ ...d, ...ringkasTerbaru(d.updates) });
 
+/** Daftar nama kategori resmi, urut sesuai pengaturan Super Admin. */
+async function muatNamaKategori() {
+  const { rows } = await query('SELECT nama FROM pica_kategori ORDER BY urutan, lower(nama)');
+  return rows.map((r) => r.nama);
+}
+
 // ── Router ────────────────────────────────────────────────────────────────
 export function picaInputRouter() {
   const r = express.Router();
@@ -295,7 +333,7 @@ export function picaInputRouter() {
     const site = String(req.body?.site || '').trim();
     if (!site) return res.status(400).json({ error: 'Site wajib diisi.' });
     siteGuard(req, site);
-    const { galat, nilai } = bersihkanIsu(req.body);
+    const { galat, nilai } = bersihkanIsu(req.body, { kategori: await muatNamaKategori() });
     if (galat.length) return galatBadRequest(res, galat);
     if (!nilai.no) {
       const { rows } = await query('SELECT no FROM pica_items WHERE site = $1', [site]);
@@ -312,7 +350,7 @@ export function picaInputRouter() {
     const it = await ambilIsu(req.params.id);
     pastikanManual(it);
     siteGuard(req, it.site);
-    const { galat, nilai } = bersihkanIsu({ ...req.body, no: it.no, updates: it.updates });
+    const { galat, nilai } = bersihkanIsu({ ...req.body, no: it.no, updates: it.updates }, { kategori: await muatNamaKategori() });
     if (galat.length) return galatBadRequest(res, galat);
     await ubahIsu(query, it.id, nilai, req.auth.email);
     const perubahan = bandingkan(bentukLama(it), bentukBaru(nilai), KOLOM_UBAH);
@@ -362,7 +400,7 @@ export function picaInputRouter() {
     if (rows.length > MAKS_BARIS_IMPOR) return res.status(400).json({ error: `Maksimal ${MAKS_BARIS_IMPOR} baris per import — bagi file menjadi beberapa bagian.` });
 
     const { rows: ada } = await query(`SELECT ${KOLOM_SELECT} FROM pica_items WHERE site = $1`, [site]);
-    const rencana = rencanaImport(rows.map((x, i) => ({ baris: Number(x.baris) || i + 1, ...x })), ada);
+    const rencana = rencanaImport(rows.map((x, i) => ({ baris: Number(x.baris) || i + 1, ...x })), ada, await muatNamaKategori());
     const hitung = (a) => rencana.filter((x) => x.aksi === a).length;
     const ringkas = { baru: hitung('baru'), ubah: hitung('ubah'), sama: hitung('sama'), ditolak: hitung('ditolak') };
     const laporan = rencana.map(({ baris, no, aksi, pesan }) => ({ baris, no, aksi, ...(pesan ? { pesan } : {}) }));
@@ -393,6 +431,80 @@ export function picaInputRouter() {
       })).filter((u) => u.perubahan.length),
     });
     res.json({ simulasi: false, ...ringkas, baris: laporan });
+  }));
+
+  // ── Kategori PICA ───────────────────────────────────────────────────────
+  // Semua pengguna boleh MEMBACA daftar (untuk memilih kategori di form/Excel dan menyaring tabel);
+  // hanya Super Admin yang boleh mengubahnya.
+  const KOLOM_KAT = `SELECT k.id, k.nama, k.urutan,
+      (SELECT COUNT(*)::int FROM pica_items i WHERE lower(i.kategori) = lower(k.nama)) AS dipakai
+    FROM pica_kategori k`;
+  const kirimDaftarKategori = async (res, status = 200) => {
+    const { rows } = await query(`${KOLOM_KAT} ORDER BY k.urutan, lower(k.nama)`);
+    res.status(status).json(rows);
+  };
+  const namaKembar = (e) => (e?.code === '23505' ? Object.assign(new Error('Kategori dengan nama itu sudah ada.'), { status: 409 }) : e);
+
+  r.get('/pica/kategori', requireAuth, wrap(async (_req, res) => { await kirimDaftarKategori(res); }));
+
+  r.post('/pica/kategori', requireAuth, requireSuperAdmin, wrap(async (req, res) => {
+    const { nama, galat } = bersihkanNamaKategori(req.body?.nama);
+    if (galat) return res.status(400).json({ error: galat });
+    try {
+      await query(
+        `INSERT INTO pica_kategori (id, nama, urutan, created_by)
+         VALUES ($1, $2, COALESCE((SELECT MAX(urutan) FROM pica_kategori), 0) + 1, $3)`,
+        [`kat-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`, nama, req.auth.email]);
+    } catch (e) { throw namaKembar(e); }
+    await kirimDaftarKategori(res, 201);
+  }));
+
+  // Ubah nama: isu yang memakai nama lama ikut berganti dalam satu transaksi, supaya tidak ada isu "yatim".
+  r.patch('/pica/kategori/:id', requireAuth, requireSuperAdmin, wrap(async (req, res) => {
+    const { nama, galat } = bersihkanNamaKategori(req.body?.nama);
+    if (galat) return res.status(400).json({ error: galat });
+    const c = await pool.connect();
+    try {
+      await c.query('BEGIN');
+      const { rows } = await c.query('SELECT nama FROM pica_kategori WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!rows[0]) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Kategori tidak ditemukan.' }); }
+      await c.query('UPDATE pica_kategori SET nama = $2 WHERE id = $1', [req.params.id, nama]);
+      await c.query('UPDATE pica_items SET kategori = $2 WHERE lower(kategori) = lower($1)', [rows[0].nama, nama]);
+      await c.query('COMMIT');
+    } catch (e) {
+      await c.query('ROLLBACK').catch(() => {});
+      throw namaKembar(e);
+    } finally { c.release(); }
+    await kirimDaftarKategori(res);
+  }));
+
+  // Urutan = urutan tampil di dropdown dan urutan saat tabel diurutkan menurut kategori.
+  r.post('/pica/kategori/urutan', requireAuth, requireSuperAdmin, wrap(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : null;
+    if (!ids?.length) return res.status(400).json({ error: 'Daftar urutan kosong.' });
+    const c = await pool.connect();
+    try {
+      await c.query('BEGIN');
+      for (let i = 0; i < ids.length; i++) await c.query('UPDATE pica_kategori SET urutan = $2 WHERE id = $1', [ids[i], i + 1]);
+      await c.query('COMMIT');
+    } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
+    await kirimDaftarKategori(res);
+  }));
+
+  // Hapus: isu yang memakainya TIDAK ikut terhapus — kategorinya dikosongkan ("Tanpa kategori").
+  r.delete('/pica/kategori/:id', requireAuth, requireSuperAdmin, wrap(async (req, res) => {
+    const c = await pool.connect();
+    let dilepas = 0;
+    try {
+      await c.query('BEGIN');
+      const { rows } = await c.query('SELECT nama FROM pica_kategori WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!rows[0]) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Kategori tidak ditemukan.' }); }
+      dilepas = (await c.query(`UPDATE pica_items SET kategori = '' WHERE lower(kategori) = lower($1)`, [rows[0].nama])).rowCount;
+      await c.query('DELETE FROM pica_kategori WHERE id = $1', [req.params.id]);
+      await c.query('COMMIT');
+    } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
+    const { rows } = await query(`${KOLOM_KAT} ORDER BY k.urutan, lower(k.nama)`);
+    res.json({ dilepas, kategori: rows });
   }));
 
   return r;
